@@ -1,0 +1,25 @@
+# Environment files
+.env
+.env.local
+
+# Vector store data
+vector_store/
+
+# Python cache and byte code
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Application logs
+*.log
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Streamlit config (pushed to git as it does not contain keys)
+#.streamlit/config.toml
