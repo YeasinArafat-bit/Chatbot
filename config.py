@@ -23,14 +23,24 @@ except ValueError:
 
 # Text Splitter Settings
 try:
-    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+    PARENT_CHUNK_SIZE = int(os.getenv("PARENT_CHUNK_SIZE", "2000"))
 except ValueError:
-    CHUNK_SIZE = 1000
+    PARENT_CHUNK_SIZE = 2000
 
 try:
-    CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+    PARENT_CHUNK_OVERLAP = int(os.getenv("PARENT_CHUNK_OVERLAP", "200"))
 except ValueError:
-    CHUNK_OVERLAP = 150
+    PARENT_CHUNK_OVERLAP = 200
+
+try:
+    CHILD_CHUNK_SIZE = int(os.getenv("CHILD_CHUNK_SIZE", "500"))
+except ValueError:
+    CHILD_CHUNK_SIZE = 500
+
+try:
+    CHILD_CHUNK_OVERLAP = int(os.getenv("CHILD_CHUNK_OVERLAP", "50"))
+except ValueError:
+    CHILD_CHUNK_OVERLAP = 50
 
 # Vector Store Path
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "vector_store")

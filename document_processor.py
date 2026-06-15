@@ -56,22 +56,44 @@ def process_pdf(file_bytes: bytes, file_name: str) -> List[Document]:
                 "The chatbot cannot read scanned/image-only PDFs without OCR."
             )
             
-        # Text Splitting
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=config.CHUNK_SIZE,
-            chunk_overlap=config.CHUNK_OVERLAP,
+        # 1. Create Parent Splitter and Child Splitter
+        parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.PARENT_CHUNK_SIZE,
+            chunk_overlap=config.PARENT_CHUNK_OVERLAP,
             length_function=len
         )
-        chunks = splitter.split_documents(docs)
+        child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.CHILD_CHUNK_SIZE,
+            chunk_overlap=config.CHILD_CHUNK_OVERLAP,
+            length_function=len
+        )
         
-        # Ensure 1-indexed page number metadata is present
-        for chunk in chunks:
-            # PyPDFLoader usually stores 0-indexed page in chunk.metadata['page']
-            page_idx = chunk.metadata.get("page", 0)
-            chunk.metadata["page_number"] = page_idx + 1
+        # 2. Split PDF into parent chunks first
+        parent_docs = parent_splitter.split_documents(docs)
+        logger.info(f"Split PDF into {len(parent_docs)} parent chunks.")
+        
+        # 3. Create child chunks that keep reference and context of their parents
+        child_docs = []
+        for i, parent_doc in enumerate(parent_docs):
+            page_idx = parent_doc.metadata.get("page", 0)
+            page_num = page_idx + 1
             
-        logger.info(f"Successfully split PDF into {len(chunks)} chunks.")
-        return chunks
+            # Split the parent text into child texts
+            sub_docs = child_splitter.split_text(parent_doc.page_content)
+            
+            for sub_doc in sub_docs:
+                child_metadata = parent_doc.metadata.copy()
+                child_metadata["page_number"] = page_num
+                child_metadata["parent_id"] = f"parent_{i}"
+                child_metadata["parent_content"] = parent_doc.page_content
+                
+                child_docs.append(Document(
+                    page_content=sub_doc,
+                    metadata=child_metadata
+                ))
+                
+        logger.info(f"Successfully created {len(child_docs)} child chunks from {len(parent_docs)} parent chunks.")
+        return child_docs
         
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}", exc_info=True)

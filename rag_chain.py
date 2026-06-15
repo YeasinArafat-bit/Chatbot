@@ -147,9 +147,27 @@ def query_rag_chain(
         "Do not use any external knowledge or assumptions. Keep your answer factual, direct, and concise."
     )
 
+    # Reconstruct context from parent chunks for hierarchical RAG, fallback to child if not present
+    seen_parents = set()
+    unique_parent_docs = []
+    
+    for doc in docs:
+        parent_id = doc.metadata.get("parent_id")
+        parent_content = doc.metadata.get("parent_content")
+        
+        content = parent_content if parent_content else doc.page_content
+        page_num = doc.metadata.get("page_number", "Unknown")
+        
+        if parent_id:
+            if parent_id not in seen_parents:
+                seen_parents.add(parent_id)
+                unique_parent_docs.append((page_num, content))
+        else:
+            unique_parent_docs.append((page_num, content))
+            
     context_str = "\n\n".join([
-        f"[Page {doc.metadata.get('page_number', 'Unknown')}]:\n{doc.page_content}"
-        for doc in docs
+        f"[Page {page_num}]:\n{content}"
+        for page_num, content in unique_parent_docs
     ])
 
     user_content = f"Context:\n{context_str}\n\nQuestion: {standalone_question}"
@@ -255,9 +273,27 @@ def query_rag_chain_stream(
         "Do not use any external knowledge or assumptions. Keep your answer factual, direct, and concise."
     )
 
+    # Reconstruct context from parent chunks for hierarchical RAG, fallback to child if not present
+    seen_parents = set()
+    unique_parent_docs = []
+    
+    for doc in docs:
+        parent_id = doc.metadata.get("parent_id")
+        parent_content = doc.metadata.get("parent_content")
+        
+        content = parent_content if parent_content else doc.page_content
+        page_num = doc.metadata.get("page_number", "Unknown")
+        
+        if parent_id:
+            if parent_id not in seen_parents:
+                seen_parents.add(parent_id)
+                unique_parent_docs.append((page_num, content))
+        else:
+            unique_parent_docs.append((page_num, content))
+            
     context_str = "\n\n".join([
-        f"[Page {doc.metadata.get('page_number', 'Unknown')}]:\n{doc.page_content}"
-        for doc in docs
+        f"[Page {page_num}]:\n{content}"
+        for page_num, content in unique_parent_docs
     ])
 
     user_content = f"Context:\n{context_str}\n\nQuestion: {standalone_question}"
