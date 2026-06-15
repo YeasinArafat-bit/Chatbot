@@ -53,6 +53,21 @@ def needs_rephrasing(question: str) -> bool:
             
     return False
 
+def _extract_text(content: Any) -> str:
+    """Safely extracts string content from model response, handling list-of-parts types."""
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and "text" in part:
+                text_parts.append(part["text"])
+            elif isinstance(part, str):
+                text_parts.append(part)
+        return "".join(text_parts).strip()
+    elif isinstance(content, str):
+        return content.strip()
+    return str(content).strip() if content is not None else ""
+
+
 def rephrase_question(
     question: str,
     chat_history: List[Dict[str, Any]],
@@ -78,14 +93,14 @@ def rephrase_question(
     try:
         logger.info(f"Attempting to rephrase question using primary model: {config.PRIMARY_MODEL}")
         response = primary_model.invoke(prompt)
-        standalone = response.content.strip()
+        standalone = _extract_text(response.content)
         logger.info(f"Successfully rephrased question: '{standalone}'")
         return standalone
     except Exception as e:
         logger.warning(f"Primary model rephrasing failed: {str(e)}. Trying fallback model: {config.FALLBACK_MODEL}")
         try:
             response = fallback_model.invoke(prompt)
-            standalone = response.content.strip()
+            standalone = _extract_text(response.content)
             logger.info(f"Successfully rephrased question with fallback model: '{standalone}'")
             return standalone
         except Exception as e_fallback:
@@ -184,14 +199,14 @@ def query_rag_chain(
     try:
         logger.info(f"Invoking primary model: {config.PRIMARY_MODEL}")
         response = primary_model.invoke(messages)
-        answer = response.content.strip()
+        answer = _extract_text(response.content)
         model_used = config.PRIMARY_MODEL
         logger.info(f"Answer generated successfully using primary model: {config.PRIMARY_MODEL}")
     except Exception as e:
         logger.warning(f"Primary model {config.PRIMARY_MODEL} failed: {str(e)}. Retrying with fallback: {config.FALLBACK_MODEL}")
         try:
             response = fallback_model.invoke(messages)
-            answer = response.content.strip()
+            answer = _extract_text(response.content)
             model_used = config.FALLBACK_MODEL
             logger.info(f"Answer generated successfully using fallback model: {config.FALLBACK_MODEL}")
         except Exception as e_fallback:

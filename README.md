@@ -65,6 +65,10 @@ Install all required libraries using pip:
 pip install -r requirements.txt
 ```
 
+> [!NOTE]
+> **Python 3.14 Compatibility:** If you are running Python 3.14, due to a compatibility constraint with older versions of `tokenizers` pulled by `chromadb==0.5.23`, please follow the [Python 3.14 Compatibility Details](#python-314-compatibility-details) instructions below to install packages successfully.
+
+
 ### 5. Setup Environment Variables
 Copy `.env.example` to a new file named `.env`:
 ```bash
@@ -126,3 +130,48 @@ Deploying your PDF Chatbot to Streamlit Community Cloud is simple:
 Below is a conceptual layout of the application dashboard:
 
 ![DocuMind UI Dashboard Mockup](https://via.placeholder.com/1000x600/0f172a/ffffff?text=DocuMind+UI+Dashboard+Mockup)
+
+---
+
+## Python 3.14 + Protobuf Compatibility Details
+
+When deploying to Streamlit Community Cloud or running locally on **Python 3.14**, a known compatibility crash occurs during `chromadb`'s import chain (`TypeError: Descriptors cannot be created directly` / `_CheckCalledFromGeneratedFile` error).
+
+Furthermore, because the `streamlit` command line tool itself imports `protobuf` during its boot-up sequence *before* reading the contents of `app.py`, adding `import patch_protobuf` to the top of `app.py` is not early enough to prevent the crash when starting via the CLI.
+
+To resolve this issue, the codebase implements the following:
+1. **Protobuf & OpenTelemetry Pinned Versions:** We explicitly pin exact versions of `protobuf==4.25.3`, `opentelemetry-api==1.25.0`, `opentelemetry-sdk==1.25.0`, and `opentelemetry-exporter-otlp-proto-grpc==1.25.0` in [requirements.txt](file:///G:/Chatbot/requirements.txt) to guarantee a compatible set of telemetry libraries.
+2. **First-Line Environment Patching (`patch_protobuf.py` & `sitecustomize.py`):** Before importing any other module (including `streamlit`, `langchain`, or `chromadb`), the application imports [patch_protobuf.py](file:///G:/Chatbot/patch_protobuf.py) as the absolute first line. To handle CLI boot sequences, we also set `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python` either via a `sitecustomize.py` hook inside the virtual environment's `site-packages` or by exporting it in the terminal shell before startup.
+3. **Local Installation on Python 3.14:**
+   Because `chromadb` requires `tokenizers<0.21`, standard pip resolution will try to compile an older version of `tokenizers` from source, which fails on Python 3.14. 
+   
+   To install dependencies successfully and configure the startup patch, run the following commands:
+   ```bash
+   # 1. Install tokenizers 0.23.1 (which has Python 3.14 wheels)
+   pip install tokenizers==0.23.1
+   
+   # 2. Install requirements without resolving dependencies
+   pip install -r requirements.txt --no-deps
+   
+   # 3. Create a startup customization patch inside the virtual environment
+   python -c "import site; import os; open(os.path.join(site.getsitepackages()[0], 'sitecustomize.py'), 'w').write('import os\nos.environ[\"PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION\"] = \"python\"\n\nimport sys\nimport types\n\nif \"google.protobuf.internal.api_implementation\" not in sys.modules:\n    api_impl = types.ModuleType(\"google.protobuf.internal.api_implementation\")\n    api_impl.Type = lambda: \"python\"\n    api_impl.Version = lambda: 2\n    api_impl.IsPythonDefaultSerializationDeterministic = lambda: False\n    api_impl._implementation_type = \"python\"\n    api_impl._c_module = None\n    sys.modules[\"google.protobuf.internal.api_implementation\"] = api_impl\n')"
+   ```
+   
+   Alternatively, you can manually set the environment variable in your terminal before running streamlit:
+   ```powershell
+   # Windows PowerShell
+   $env:PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="python"
+   streamlit run app.py
+   ```
+   ```bash
+   # Linux / macOS
+   export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="python"
+   streamlit run app.py
+   ```
+4. **Streamlit Community Cloud Deployment:**
+   If deploying to a Streamlit Community Cloud environment running Python 3.14, configure the following environment variables in **Settings -> Secrets** to bypass the crash during app boot and allow successful builds:
+   ```toml
+   PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION = "python"
+   PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
+   ```
+
