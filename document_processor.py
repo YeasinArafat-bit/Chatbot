@@ -8,15 +8,6 @@ import hashlib
 from typing import List
 from langchain_core.embeddings import Embeddings
 from langchain_core.documents import Document
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_huggingface import HuggingFaceEmbeddings
-
-try:
-    from langchain_chroma import Chroma
-except ImportError:
-    from langchain_community.vectorstores import Chroma
 
 import config
 from logger import get_logger
@@ -35,6 +26,9 @@ def process_pdf(file_bytes: bytes, file_name: str) -> List[Document]:
     """Loads PDF from bytes, extracts text per page, validates the content,
     splits it into chunks, and returns the list of chunks with 1-indexed page metadata.
     """
+    from langchain_community.document_loaders import PyPDFLoader
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    
     logger.info(f"Starting processing of file: {file_name}")
     
     # Save uploaded bytes to a temporary file for PyPDFLoader
@@ -206,6 +200,7 @@ def get_embedding_model(progress_callback=None) -> Embeddings:
     """Returns the correct embedding model based on EMBEDDING_PROVIDER configuration."""
     provider = config.EMBEDDING_PROVIDER
     if provider == "google":
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
         if not config.GEMINI_API_KEY:
             raise ValueError("GEMINI_API_KEY is not set in the environment variables.")
         logger.info(
@@ -218,6 +213,7 @@ def get_embedding_model(progress_callback=None) -> Embeddings:
         return RateLimitedEmbeddings(base_embeddings, progress_callback=progress_callback)
     else:
         # Default to local
+        from langchain_huggingface import HuggingFaceEmbeddings
         logger.info(
             f"Using LOCAL embeddings (sentence-transformers) — no rate limits, no API cost. Model: {config.LOCAL_EMBEDDING_MODEL}"
         )
@@ -232,6 +228,11 @@ def get_vector_store(collection_name: str, chunks: List[Document] = None, progre
     """Retrieves or creates a Chroma vector store for the given collection name.
     If chunks are provided and the store is empty, it will add the chunks to the store.
     """
+    try:
+        from langchain_chroma import Chroma
+    except ImportError:
+        from langchain_community.vectorstores import Chroma
+        
     logger.info(f"Accessing vector store for collection: {collection_name}")
     
     embeddings = get_embedding_model(progress_callback=progress_callback)

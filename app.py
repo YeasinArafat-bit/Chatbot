@@ -4,12 +4,7 @@ import streamlit as st
 
 import config
 from logger import get_logger
-from document_processor import (
-    calculate_file_hash,
-    process_pdf,
-    get_vector_store
-)
-from rag_chain import query_rag_chain, query_rag_chain_stream
+# Lazy load modules inside callbacks for instant initial page loading
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -261,6 +256,7 @@ with st.sidebar:
                 )
                 logger.warning(f"File upload rejected due to size: {uploaded_file.name} ({file_size_mb:.2f}MB)")
             else:
+                from document_processor import calculate_file_hash, get_vector_store, process_pdf
                 file_bytes = uploaded_file.read()
                 file_hash = calculate_file_hash(file_bytes)
                 
@@ -428,6 +424,7 @@ else:
                 status_placeholder.markdown("🔍 *DocuMind is retrieving facts and referencing pages...*")
                 
                 # Stream the response using st.write_stream
+                from rag_chain import query_rag_chain_stream
                 stream_generator = query_rag_chain_stream(user_query, chat_history, db, meta)
                 
                 def stream_wrapper():
