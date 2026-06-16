@@ -437,8 +437,15 @@ else:
                         if not cleared:
                             status_placeholder.empty()
                             cleared = True
-                        yield chunk
-                        time.sleep(0.015) # Smooth natural typing speed simulation
+                        
+                        # Split chunk by space to simulate a smooth word-by-word typing speed
+                        words = chunk.split(" ")
+                        for idx, word in enumerate(words):
+                            if idx == len(words) - 1:
+                                yield word
+                            else:
+                                yield word + " "
+                            time.sleep(0.04)
                     if not cleared:
                         status_placeholder.empty()
                         
