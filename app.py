@@ -193,6 +193,11 @@ h1, h2, h3, h4, h5, h6 {
     font-size: 0.9rem;
     color: #e2e8f0;
 }
+
+/* Hide upload icon / plus sign in file uploader */
+[data-testid="stFileUploader"] svg, [data-testid="stFileUploaderIcon"] {
+    display: none !important;
+}
 </style>
 """
 st.markdown(custom_css, unsafe_allow_html=True)
@@ -231,9 +236,17 @@ with st.sidebar:
     # 1. Document Upload Phase (Show in sidebar if no active collection is loaded)
     if not st.session_state["collection_name"]:
         st.markdown("### 📄 Upload Document")
+        
+        # Disable uploader if a file is already being processed to prevent double-upload clicks
+        is_disabled = False
+        if "pdf_uploader" in st.session_state and st.session_state["pdf_uploader"] is not None:
+            is_disabled = True
+            
         uploaded_file = st.file_uploader(
             "Choose a PDF file to begin",
             type=["pdf"],
+            key="pdf_uploader",
+            disabled=is_disabled,
             help=f"Maximum file size allowed is {config.MAX_FILE_SIZE_MB}MB."
         )
         
@@ -259,7 +272,7 @@ with st.sidebar:
                     
                 logger.info(f"File uploaded successfully: {uploaded_file.name} ({size_str}), Hash: {file_hash}")
                 
-                with st.spinner("Processing document and generating embeddings..."):
+                with st.spinner("Processing..."):
                     try:
                         # Check if Chroma already has this collection stored
                         db_exists = False
@@ -299,7 +312,6 @@ with st.sidebar:
                         st.session_state["pages_processed"] = pages_processed
                         st.session_state["db"] = db
                         
-                        st.success(f"🎉 Successfully processed {pages_processed} pages!")
                         st.rerun()
                         
                     except ValueError as val_err:
@@ -385,17 +397,11 @@ else:
                 source_pages = msg.get("source_pages", [])
                 model_used = msg.get("model_used", "")
                 
-                # Check if we have any metadata to display
-                if source_pages or model_used:
+                # Check if we have any source pages to display
+                if source_pages:
                     citation_html = '<div class="citation-container">'
-                    
-                    if source_pages:
-                        page_chips = " ".join([f'<span class="citation-chip">Page {p}</span>' for p in source_pages])
-                        citation_html += f'<span>Sources: {page_chips}</span>'
-                        
-                    if model_used:
-                        citation_html += f'<span class="model-badge">Model: {model_used}</span>'
-                        
+                    page_chips = " ".join([f'<span class="citation-chip">Page {p}</span>' for p in source_pages])
+                    citation_html += f'<span>Sources: {page_chips}</span>'
                     citation_html += '</div>'
                     st.markdown(citation_html, unsafe_allow_html=True)
 
@@ -425,29 +431,46 @@ else:
                 stream_generator = query_rag_chain_stream(user_query, chat_history, db, meta)
                 
                 def stream_wrapper():
+                    import time
                     cleared = False
                     for chunk in stream_generator:
                         if not cleared:
                             status_placeholder.empty()
                             cleared = True
                         yield chunk
+                        time.sleep(0.015) # Smooth natural typing speed simulation
                     if not cleared:
                         status_placeholder.empty()
                         
                 answer = st.write_stream(stream_wrapper())
 
+                # Post-process response to see if it failed to find answer
+                not_found_indicators = [
+                    "couldn't find this in the document",
+                    "could not find this in the document",
+                    "i couldn't find this"
+                ]
                 
-                source_pages = meta["source_pages"]
+                if any(indicator in answer.lower() for indicator in not_found_indicators):
+                    source_pages = []
+                else:
+                    # Run page filtering with a loading spinner for a clean ChatGPT-like experience
+                    with st.spinner("🔍 Referencing source pages..."):
+                        from rag_chain import filter_used_pages
+                        source_pages = filter_used_pages(
+                            answer,
+                            meta.get("retrieved_docs", []),
+                            meta.get("primary_model"),
+                            meta.get("fallback_model")
+                        )
+                
                 model_used = meta["model_used"]
                 
-                # Display citations and model badge below completed stream
-                if source_pages or model_used:
+                # Display citations below completed stream
+                if source_pages:
                     citation_html = '<div class="citation-container">'
-                    if source_pages:
-                        page_chips = " ".join([f'<span class="citation-chip">Page {p}</span>' for p in source_pages])
-                        citation_html += f'<span>Sources: {page_chips}</span>'
-                    if model_used:
-                        citation_html += f'<span class="model-badge">Model: {model_used}</span>'
+                    page_chips = " ".join([f'<span class="citation-chip">Page {p}</span>' for p in source_pages])
+                    citation_html += f'<span>Sources: {page_chips}</span>'
                     citation_html += '</div>'
                     st.markdown(citation_html, unsafe_allow_html=True)
                 

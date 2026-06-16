@@ -127,9 +127,47 @@ Deploying your PDF Chatbot to Streamlit Community Cloud is simple:
 
 ## Screenshots
 
-Below is a conceptual layout of the application dashboard:
+Here is the DocuMind user interface in action:
 
-![DocuMind UI Dashboard Mockup](https://via.placeholder.com/1000x600/0f172a/ffffff?text=DocuMind+UI+Dashboard+Mockup)
+![DocuMind UI Chat Interface](screenshots/screenshot1.png)
+
+![DocuMind UI Document Ingestion](screenshots/screenshot2.png)
+
+## Scaling Guide (Local vs. Google Embeddings)
+
+By default, DocuMind uses free local embeddings (`sentence-transformers/all-MiniLM-L6-v2`) to provide fast, cost-free, and rate-limit-free PDF indexing suitable for normal/low traffic and demos. 
+
+As your application scales for high-traffic production environments, you can switch to Google's paid embedding API without modifying any code:
+
+1. **Enable Billing:** Ensure that your Google Gemini API key is associated with a paid billing account on Google AI Studio to handle high-throughput calls.
+2. **Update Environment Configuration:** In your `.env` file, change the `EMBEDDING_PROVIDER` setting:
+   ```ini
+   EMBEDDING_PROVIDER=google
+   ```
+3. **Restart the Application:** Restart Streamlit for the configuration to take effect.
+
+> [!WARNING]  
+> **Automatic Re-indexing Note:** Because local embeddings and Google embeddings are not numerically compatible (they reside in different vector spaces), DocuMind automatically detects if the provider changes for a previously indexed PDF. The application will warn you in the console logs and automatically delete the incompatible collection, triggering a clean re-indexing of the document when accessed.
+
+---
+
+## 🔍 Hybrid Search (Semantic + BM25 Keyword Search)
+
+To maximize retrieval accuracy, DocuMind features a **Hybrid Search** retrieval system.
+
+### Why Hybrid Search?
+* **Semantic Vector Search** excels at capturing the conceptual meaning, synonyms, and context of queries (e.g., "what are their sustainability plans").
+* **BM25 Keyword Search** excels at exact matching for specific codes, numbers, names, and precise terms (e.g., CIK numbers, exact dollar figures, dates, or proper nouns) which embeddings can sometimes dilute or miss.
+
+By combining both using an `EnsembleRetriever` and performing reciprocal rank fusion, the chatbot provides highly accurate answers for both conceptual and exact lookup questions.
+
+### Configuration
+You can control the retrieval mode and weights via your `.env` or `config.py` file:
+* `RETRIEVAL_MODE`: Set to `hybrid` (default) to use hybrid search, or `semantic_only` to revert to standard vector search.
+* `SEMANTIC_SEARCH_WEIGHT`: The weight given to the semantic retriever (default: `0.5`).
+* `KEYWORD_SEARCH_WEIGHT`: The weight given to the BM25 keyword retriever (default: `0.5`).
+
+The BM25 index is built from the same document chunks as the vector database and is cached on disk per document as a `.pkl` file in the `vector_store/` folder to prevent rebuilding from scratch on repeat uploads.
 
 ---
 

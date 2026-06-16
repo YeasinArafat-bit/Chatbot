@@ -13,7 +13,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "gemini-flash-latest")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash")
 
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
+# Embedding Configuration
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local").lower()
+LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+GOOGLE_EMBEDDING_MODEL = os.getenv("GOOGLE_EMBEDDING_MODEL", os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"))
+EMBEDDING_MODEL = GOOGLE_EMBEDDING_MODEL
 
 # File Upload Limit
 try:
@@ -44,3 +48,28 @@ except ValueError:
 
 # Vector Store Path
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "vector_store")
+
+# Embedding API settings for faster ingestion
+try:
+    EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "100"))
+except ValueError:
+    EMBEDDING_BATCH_SIZE = 100
+
+try:
+    EMBEDDING_SLEEP_SECONDS = float(os.getenv("EMBEDDING_SLEEP_SECONDS", "0.2"))
+except ValueError:
+    EMBEDDING_SLEEP_SECONDS = 0.2
+# Rate limiting for Gemini free tier API limits
+ENABLE_RATE_LIMITER = os.getenv("ENABLE_RATE_LIMITER", "True").lower() in ("true", "1", "yes")
+
+# Hybrid Retrieval Settings
+RETRIEVAL_MODE = os.getenv("RETRIEVAL_MODE", "hybrid").lower()
+try:
+    SEMANTIC_SEARCH_WEIGHT = float(os.getenv("SEMANTIC_SEARCH_WEIGHT", "0.5"))
+except ValueError:
+    SEMANTIC_SEARCH_WEIGHT = 0.5
+
+try:
+    KEYWORD_SEARCH_WEIGHT = float(os.getenv("KEYWORD_SEARCH_WEIGHT", "0.5"))
+except ValueError:
+    KEYWORD_SEARCH_WEIGHT = 0.5

@@ -1,6 +1,7 @@
 import patch_protobuf
 import os
 import tempfile
+import pickle
 
 import time
 import hashlib
@@ -10,6 +11,7 @@ from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 
 try:
     from langchain_chroma import Chroma
@@ -107,10 +109,12 @@ class RateLimitedEmbeddings(Embeddings):
     """A wrapper for LangChain Embeddings that batches requests and adds retry logic 
     with exponential backoff when encountering rate limits (HTTP 429 / RESOURCE_EXHAUSTED).
     """
-    def __init__(self, base_embeddings, batch_size=20, sleep_between_batches=3.0):
+    def __init__(self, base_embeddings, batch_size=None, sleep_between_batches=None, progress_callback=None):
         self.base_embeddings = base_embeddings
-        self.batch_size = batch_size
-        self.sleep_between_batches = sleep_between_batches
+        self.batch_size = batch_size if batch_size is not None else config.EMBEDDING_BATCH_SIZE
+        self.sleep_between_batches = sleep_between_batches if sleep_between_batches is not None else config.EMBEDDING_SLEEP_SECONDS
+        self.progress_callback = progress_callback
+        self.request_history = [] # list of tuples: (timestamp, char_count)
         
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         embeddings = []
@@ -122,7 +126,39 @@ class RateLimitedEmbeddings(Embeddings):
         for i in range(0, total_texts, self.batch_size):
             batch = texts[i:i + self.batch_size]
             batch_num = i // self.batch_size + 1
-            logger.info(f"RateLimitedEmbeddings: Processing batch {batch_num}/{total_batches} ({len(batch)} chunks)...")
+            
+            # Apply sliding window rate limiter if enabled
+            if config.ENABLE_RATE_LIMITER:
+                batch_chars = sum(len(text) for text in batch)
+                while True:
+                    now = time.time()
+                    # Keep history of only the last 60 seconds
+                    self.request_history = [r for r in self.request_history if now - r[0] < 60.0]
+                    
+                    recent_requests = len(self.request_history)
+                    recent_chars = sum(r[1] for r in self.request_history)
+                    
+                    # Gemini Free Tier limit: max 15 RPM and ~30k tokens (~100k-120k characters) per minute
+                    if recent_requests >= 14 or (recent_chars + batch_chars) > 100000:
+                        if self.request_history:
+                            oldest_time = self.request_history[0][0]
+                            wait_time = 60.0 - (now - oldest_time) + 0.5
+                            if wait_time > 0:
+                                msg = f"Rate limit protection: pausing for {wait_time:.1f}s to stay under free-tier API limits..."
+                                logger.info(msg)
+                                if self.progress_callback:
+                                    self.progress_callback(msg)
+                                time.sleep(wait_time)
+                        else:
+                            time.sleep(5)
+                            break
+                    else:
+                        break
+            
+            msg = f"Generating embeddings: batch {batch_num}/{total_batches} ({len(batch)} chunks)..."
+            logger.info(f"RateLimitedEmbeddings: {msg}")
+            if self.progress_callback:
+                self.progress_callback(msg)
             
             retries = 5
             backoff = 10.0
@@ -130,14 +166,20 @@ class RateLimitedEmbeddings(Embeddings):
                 try:
                     batch_embeddings = self.base_embeddings.embed_documents(batch)
                     embeddings.extend(batch_embeddings)
+                    # Record successful request in history
+                    if config.ENABLE_RATE_LIMITER:
+                        self.request_history.append((time.time(), sum(len(text) for text in batch)))
                     break
                 except Exception as e:
                     err_msg = str(e)
                     if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                        logger.warning(
-                            f"RateLimitedEmbeddings: Rate limit hit (429/RESOURCE_EXHAUSTED) on batch {batch_num}. "
+                        warn_msg = (
+                            f"Rate limit hit (429/RESOURCE_EXHAUSTED) on batch {batch_num}. "
                             f"Waiting {backoff} seconds before retry. {retries} retries remaining."
                         )
+                        logger.warning(f"RateLimitedEmbeddings: {warn_msg}")
+                        if self.progress_callback:
+                            self.progress_callback(f"⚠️ Rate limit hit. Pausing for {backoff:.1f}s...")
                         time.sleep(backoff)
                         retries -= 1
                         backoff *= 2 # Exponential backoff
@@ -160,26 +202,46 @@ class RateLimitedEmbeddings(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         return self.base_embeddings.embed_query(text)
 
-def get_vector_store(collection_name: str, chunks: List[Document] = None) -> Chroma:
+def get_embedding_model(progress_callback=None) -> Embeddings:
+    """Returns the correct embedding model based on EMBEDDING_PROVIDER configuration."""
+    provider = config.EMBEDDING_PROVIDER
+    if provider == "google":
+        if not config.GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is not set in the environment variables.")
+        logger.info(
+            f"Using GOOGLE embeddings (API) — rate limited, billed per use. Model: {config.GOOGLE_EMBEDDING_MODEL}"
+        )
+        base_embeddings = GoogleGenerativeAIEmbeddings(
+            model=config.GOOGLE_EMBEDDING_MODEL,
+            google_api_key=config.GEMINI_API_KEY
+        )
+        return RateLimitedEmbeddings(base_embeddings, progress_callback=progress_callback)
+    else:
+        # Default to local
+        logger.info(
+            f"Using LOCAL embeddings (sentence-transformers) — no rate limits, no API cost. Model: {config.LOCAL_EMBEDDING_MODEL}"
+        )
+        if progress_callback:
+            progress_callback(f"Loading local embedding model ({config.LOCAL_EMBEDDING_MODEL})...")
+        embeddings = HuggingFaceEmbeddings(
+            model_name=config.LOCAL_EMBEDDING_MODEL
+        )
+        return embeddings
+
+def get_vector_store(collection_name: str, chunks: List[Document] = None, progress_callback=None) -> Chroma:
     """Retrieves or creates a Chroma vector store for the given collection name.
     If chunks are provided and the store is empty, it will add the chunks to the store.
     """
-    if not config.GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not set in the environment variables.")
-        
     logger.info(f"Accessing vector store for collection: {collection_name}")
     
-    base_embeddings = GoogleGenerativeAIEmbeddings(
-        model=config.EMBEDDING_MODEL,
-        google_api_key=config.GEMINI_API_KEY
-    )
-    embeddings = RateLimitedEmbeddings(base_embeddings)
+    embeddings = get_embedding_model(progress_callback=progress_callback)
     
     # Initialize Chroma db
     db = Chroma(
         collection_name=collection_name,
         embedding_function=embeddings,
-        persist_directory=config.VECTOR_STORE_PATH
+        persist_directory=config.VECTOR_STORE_PATH,
+        collection_metadata={"provider": config.EMBEDDING_PROVIDER}
     )
     
     # Check if documents already exist in the collection
@@ -190,14 +252,93 @@ def get_vector_store(collection_name: str, chunks: List[Document] = None) -> Chr
         existing_count = 0
         
     if existing_count > 0:
-        logger.info(f"Collection {collection_name} already populated with {existing_count} chunks. Skipping embedding.")
-        return db
+        # Check if stored provider in collection metadata matches the current provider
+        stored_metadata = db._collection.metadata
+        stored_provider = None
+        if stored_metadata:
+            stored_provider = stored_metadata.get("provider")
+            
+        current_provider = config.EMBEDDING_PROVIDER
+        
+        if stored_provider and stored_provider != current_provider:
+            logger.warning(
+                f"⚠️ WARNING: Embedding provider switch detected for collection '{collection_name}'. "
+                f"Stored: '{stored_provider}', Current: '{current_provider}'. "
+                "Local and Google embeddings are not numerically compatible. Re-indexing collection..."
+            )
+            if progress_callback:
+                progress_callback(
+                    f"⚠️ Provider switch detected ({stored_provider} -> {current_provider}). Re-indexing..."
+                )
+            
+            # Delete incompatible collection
+            db.delete_collection()
+            
+            # Recreate Chroma db with current configuration
+            db = Chroma(
+                collection_name=collection_name,
+                embedding_function=embeddings,
+                persist_directory=config.VECTOR_STORE_PATH,
+                collection_metadata={"provider": current_provider}
+            )
+            existing_count = 0
+        else:
+            logger.info(f"Collection {collection_name} already populated with {existing_count} chunks. Skipping embedding.")
+            check_and_build_bm25_from_db(collection_name, db)
+            return db
         
     if chunks:
         logger.info(f"Embedding {len(chunks)} chunks into collection {collection_name}...")
         db.add_documents(chunks)
         logger.info("Embedding and storage complete.")
+        build_and_persist_bm25(collection_name, chunks)
     else:
         logger.warning(f"Collection {collection_name} is empty and no chunks were provided to populate it.")
         
     return db
+
+def build_and_persist_bm25(collection_name: str, chunks: List[Document]):
+    """Builds a BM25Retriever from chunks and serializes it using pickle."""
+    try:
+        from langchain_community.retrievers import BM25Retriever
+        logger.info(f"Building BM25 index for collection {collection_name} with {len(chunks)} chunks...")
+        bm25_retriever = BM25Retriever.from_documents(chunks)
+        
+        # Ensure persist directory exists
+        os.makedirs(config.VECTOR_STORE_PATH, exist_ok=True)
+        bm25_path = os.path.join(config.VECTOR_STORE_PATH, f"bm25_{collection_name}.pkl")
+        
+        with open(bm25_path, "wb") as f:
+            pickle.dump(bm25_retriever, f)
+            
+        logger.info(f"Successfully persisted BM25 index to {bm25_path}")
+    except Exception as e:
+        logger.error(f"Failed to build/persist BM25 index: {str(e)}", exc_info=True)
+
+def check_and_build_bm25_from_db(collection_name: str, db: Chroma):
+    """Checks if the BM25 index is cached. If not, retrieves all docs from Chroma and builds it."""
+    bm25_path = os.path.join(config.VECTOR_STORE_PATH, f"bm25_{collection_name}.pkl")
+    if os.path.exists(bm25_path):
+        logger.info(f"BM25 index for {collection_name} is already cached.")
+        return
+        
+    logger.info(f"BM25 index not found at {bm25_path}. Reconstructing from Chroma database...")
+    try:
+        results = db.get()
+        ids = results.get("ids", [])
+        if not ids:
+            logger.warning(f"No documents found in Chroma collection {collection_name} to build BM25.")
+            return
+            
+        metadatas = results.get("metadatas", [])
+        documents = results.get("documents", [])
+        
+        chunks = []
+        for i in range(len(ids)):
+            meta = metadatas[i] if i < len(metadatas) else {}
+            doc_text = documents[i] if i < len(documents) else ""
+            chunks.append(Document(page_content=doc_text, metadata=meta))
+            
+        build_and_persist_bm25(collection_name, chunks)
+    except Exception as e:
+        logger.error(f"Failed to reconstruct BM25 from Chroma: {str(e)}", exc_info=True)

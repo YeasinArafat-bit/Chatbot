@@ -4,6 +4,7 @@
 
 # Vector store data
 vector_store/
+test_dir/
 
 # Python cache and byte code
 __pycache__/
