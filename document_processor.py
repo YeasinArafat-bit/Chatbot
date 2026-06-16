@@ -224,7 +224,7 @@ def get_embedding_model(progress_callback=None) -> Embeddings:
         )
         return embeddings
 
-def get_vector_store(collection_name: str, chunks: List[Document] = None, progress_callback=None) -> Chroma:
+def get_vector_store(collection_name: str, chunks: List[Document] = None, progress_callback=None) -> "Chroma":
     """Retrieves or creates a Chroma vector store for the given collection name.
     If chunks are provided and the store is empty, it will add the chunks to the store.
     """
