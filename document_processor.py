@@ -316,7 +316,7 @@ def build_and_persist_bm25(collection_name: str, chunks: List[Document]):
     except Exception as e:
         logger.error(f"Failed to build/persist BM25 index: {str(e)}", exc_info=True)
 
-def check_and_build_bm25_from_db(collection_name: str, db: Chroma):
+def check_and_build_bm25_from_db(collection_name: str, db: "Chroma"):
     """Checks if the BM25 index is cached. If not, retrieves all docs from Chroma and builds it."""
     bm25_path = os.path.join(config.VECTOR_STORE_PATH, f"bm25_{collection_name}.pkl")
     if os.path.exists(bm25_path):
