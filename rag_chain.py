@@ -77,18 +77,37 @@ def get_hybrid_retriever(db: Chroma, k: int) -> BaseRetriever:
         return semantic_retriever
         
     collection_name = db._collection.name
-    bm25_path = os.path.join(config.VECTOR_STORE_PATH, f"bm25_{collection_name}.pkl")
-    
     bm25_retriever = None
-    if os.path.exists(bm25_path):
-        try:
-            logger.info(f"Loading cached BM25 index from {bm25_path}")
-            with open(bm25_path, "rb") as f:
-                bm25_retriever = pickle.load(f)
+    
+    # Try session state cache first
+    try:
+        import streamlit as st
+        if "bm25_retrievers" not in st.session_state:
+            st.session_state["bm25_retrievers"] = {}
+        if collection_name in st.session_state["bm25_retrievers"]:
+            logger.debug(f"Retrieving cached BM25 retriever from session state for collection {collection_name}")
+            bm25_retriever = st.session_state["bm25_retrievers"][collection_name]
             bm25_retriever.k = k
-        except Exception as e:
-            logger.warning(f"Failed to load cached BM25 index: {str(e)}")
-            
+    except Exception as e:
+        logger.warning(f"Session state not available or failed to access BM25 cache: {str(e)}")
+        
+    if bm25_retriever is None:
+        bm25_path = os.path.join(config.VECTOR_STORE_PATH, f"bm25_{collection_name}.pkl")
+        if os.path.exists(bm25_path):
+            try:
+                logger.info(f"Loading cached BM25 index from {bm25_path}")
+                with open(bm25_path, "rb") as f:
+                    bm25_retriever = pickle.load(f)
+                bm25_retriever.k = k
+                # Cache it in session state
+                try:
+                    import streamlit as st
+                    st.session_state["bm25_retrievers"][collection_name] = bm25_retriever
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Failed to load cached BM25 index: {str(e)}")
+                
     if bm25_retriever is None:
         logger.info("BM25 index cache missing or failed to load. Building from Chroma on the fly...")
         try:
@@ -112,6 +131,13 @@ def get_hybrid_retriever(db: Chroma, k: int) -> BaseRetriever:
                 with open(bm25_path, "wb") as f:
                     pickle.dump(bm25_retriever, f)
                 logger.info(f"Persisted rebuilt BM25 index to {bm25_path}")
+                
+                # Cache it in session state
+                try:
+                    import streamlit as st
+                    st.session_state["bm25_retrievers"][collection_name] = bm25_retriever
+                except Exception:
+                    pass
         except Exception as build_err:
             logger.error(f"Failed to dynamically build BM25 retriever: {str(build_err)}", exc_info=True)
             
@@ -284,15 +310,21 @@ def retrieve_and_combine_docs(
     standalone_question: str,
     db: Chroma,
     primary_model: ChatGoogleGenerativeAI,
-    fallback_model: ChatGoogleGenerativeAI
+    fallback_model: ChatGoogleGenerativeAI,
+    status_callback=None
 ) -> Tuple[List[Document], bool]:
     """Decomposes the query if compound, runs retrieval for each sub-query,
     and returns a combined, deduplicated list of documents. Also returns a boolean
     indicating if the query was compound.
     """
+    if status_callback:
+        status_callback("Analyzing question complexity...")
+        
     # Fast local pre-check to bypass decomposition for simple questions
     if not is_likely_compound(standalone_question):
         logger.info(f"Local heuristic detected simple question. Bypassing decomposition LLM call for: '{standalone_question}'")
+        if status_callback:
+            status_callback("Searching document...")
         # Simple question: retrieve N=4 chunks
         retriever = get_hybrid_retriever(db, 4)
         docs = retriever.invoke(standalone_question)
@@ -300,6 +332,9 @@ def retrieve_and_combine_docs(
         return docs, False
         
     logger.info(f"Local heuristic detected likely compound question. Proceeding to LLM decomposition for: '{standalone_question}'")
+    if status_callback:
+        status_callback("Breaking down compound question...")
+        
     # Decompose the question into sub-queries
     sub_queries = decompose_query(standalone_question, primary_model, fallback_model)
     
@@ -307,15 +342,30 @@ def retrieve_and_combine_docs(
     
     if is_compound:
         logger.info(f"Compound question detected. Decomposed sub-queries: {sub_queries}")
+        if status_callback:
+            status_callback(f"Searching document for: {', '.join(sub_queries)}...")
+            
         # When compound, retrieve N=5 chunks per sub-query to ensure adequate coverage
         k = 5
         all_docs = []
-        for sub_q in sub_queries:
+        
+        import concurrent.futures
+        def retrieve_sub_query(sub_q):
             logger.info(f"Retrieving top {k} chunks for sub-query: '{sub_q}'")
             retriever = get_hybrid_retriever(db, k)
             sub_docs = retriever.invoke(sub_q)
             logger.info(f"Retrieved {len(sub_docs)} chunks for sub-query: '{sub_q}'. Pages: {[d.metadata.get('page_number') for d in sub_docs]}")
-            all_docs.extend(sub_docs)
+            return sub_docs
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(sub_queries)) as executor:
+            future_to_query = {executor.submit(retrieve_sub_query, sub_q): sub_q for sub_q in sub_queries}
+            for future in concurrent.futures.as_completed(future_to_query):
+                sub_q = future_to_query[future]
+                try:
+                    sub_docs = future.result()
+                    all_docs.extend(sub_docs)
+                except Exception as exc:
+                    logger.error(f"Sub-query '{sub_q}' generated an exception during retrieval: {exc}", exc_info=True)
             
         # Deduplicate retrieved child documents by page_content to avoid redundant text
         seen_contents = set()
@@ -330,6 +380,8 @@ def retrieve_and_combine_docs(
     else:
         # Simple question: retrieve N=4 chunks as before
         logger.info(f"LLM decomposition decided question is simple after all. Retrieving top 4 chunks.")
+        if status_callback:
+            status_callback("Searching document...")
         retriever = get_hybrid_retriever(db, 4)
         docs = retriever.invoke(standalone_question)
         logger.info(f"Retrieved {len(docs)} chunks for simple question.")
@@ -459,7 +511,8 @@ def rephrase_question(
 def query_rag_chain(
     question: str,
     chat_history: List[Dict[str, Any]],
-    db: Chroma
+    db: Chroma,
+    status_callback=None
 ) -> Dict[str, Any]:
     """Executes the Conversational RAG pipeline:
     1. Rephrases follow-up questions using chat history.
@@ -469,6 +522,12 @@ def query_rag_chain(
     """
     if not config.GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY is not set in the environment variables.")
+
+    start_time = time.time()
+    logger.info(f"RAG Chain query start (non-streaming): '{question}'")
+
+    if status_callback:
+        status_callback("Checking history...")
 
     # Initialize chat models
     primary_model = ChatGoogleGenerativeAI(
@@ -484,9 +543,14 @@ def query_rag_chain(
 
     # 1. Rephrase user question if chat history exists
     standalone_question = rephrase_question(question, chat_history, primary_model, fallback_model)
+    rephrase_time = time.time() - start_time
+    logger.info(f"Timing - Rephrasing completed: {rephrase_time:.4f}s elapsed (standalone: '{standalone_question}')")
 
     # 2. Retrieve chunks (decomposes the query if compound)
-    docs, is_compound = retrieve_and_combine_docs(standalone_question, db, primary_model, fallback_model)
+    retrieval_start = time.time()
+    docs, is_compound = retrieve_and_combine_docs(standalone_question, db, primary_model, fallback_model, status_callback)
+    retrieval_time = time.time() - retrieval_start
+    logger.info(f"Timing - Retrieval completed: {retrieval_time:.4f}s (compound: {is_compound})")
 
     # Extract unique, sorted page numbers
     source_pages = sorted(list(set(
@@ -552,6 +616,11 @@ def query_rag_chain(
     answer = None
     model_used = None
     
+    llm_start = time.time()
+    logger.info(f"Timing - Invoking LLM at {time.time() - start_time:.4f}s elapsed")
+    if status_callback:
+        status_callback("Generating answer...")
+
     try:
         logger.info(f"Invoking primary model: {config.PRIMARY_MODEL}")
         response = primary_model.invoke(messages)
@@ -568,6 +637,9 @@ def query_rag_chain(
         except Exception as e_fallback:
             logger.error(f"Both primary and fallback models failed: {str(e_fallback)}", exc_info=True)
             raise e_fallback
+
+    llm_time = time.time() - llm_start
+    logger.info(f"Timing - LLM call completed: {llm_time:.4f}s. Total pipeline time: {time.time() - start_time:.4f}s")
 
     # Determine if answer indicates information wasn't found
     not_found_indicators = [
@@ -589,7 +661,8 @@ def query_rag_chain_stream(
     question: str,
     chat_history: List[Dict[str, Any]],
     db: Chroma,
-    meta: Dict[str, Any]
+    meta: Dict[str, Any],
+    status_callback=None
 ):
     """Executes the Conversational RAG pipeline in streaming mode:
     1. Rephrases follow-up questions using chat history if needed.
@@ -600,6 +673,12 @@ def query_rag_chain_stream(
     """
     if not config.GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY is not set in the environment variables.")
+
+    start_time = time.time()
+    logger.info(f"RAG Chain query start (streaming): '{question}'")
+
+    if status_callback:
+        status_callback("Checking history...")
 
     # Initialize chat models
     primary_model = ChatGoogleGenerativeAI(
@@ -615,9 +694,14 @@ def query_rag_chain_stream(
 
     # 1. Rephrase user question if needed
     standalone_question = rephrase_question(question, chat_history, primary_model, fallback_model)
+    rephrase_time = time.time() - start_time
+    logger.info(f"Timing - Rephrasing completed: {rephrase_time:.4f}s elapsed (standalone: '{standalone_question}')")
 
     # 2. Retrieve chunks (decomposes the query if compound)
-    docs, is_compound = retrieve_and_combine_docs(standalone_question, db, primary_model, fallback_model)
+    retrieval_start = time.time()
+    docs, is_compound = retrieve_and_combine_docs(standalone_question, db, primary_model, fallback_model, status_callback)
+    retrieval_time = time.time() - retrieval_start
+    logger.info(f"Timing - Retrieval completed: {retrieval_time:.4f}s (compound: {is_compound})")
 
     # Store metadata
     meta["source_pages"] = []
@@ -680,7 +764,10 @@ def query_rag_chain_stream(
     ]
 
     # 4. Stream LLM chunks with fallback mechanism
-    logger.info(f"Streaming model output for query: '{standalone_question}'")
+    llm_start = time.time()
+    logger.info(f"Timing - Invoking LLM stream at {time.time() - start_time:.4f}s elapsed")
+    if status_callback:
+        status_callback("Generating answer...")
     
     # Track generated text to verify if "not found" indicators are present
     full_text = []
@@ -688,6 +775,7 @@ def query_rag_chain_stream(
     try:
         logger.info(f"Attempting stream with primary model: {config.PRIMARY_MODEL}")
         stream = primary_model.stream(messages)
+        first_token = True
         for chunk in stream:
             token = chunk.content
             
@@ -704,17 +792,22 @@ def query_rag_chain_stream(
                 token_str = str(token) if token is not None else ""
                 
             if token_str:
+                if first_token:
+                    first_token_time = time.time() - start_time
+                    logger.info(f"Timing - First token received at {first_token_time:.4f}s elapsed (from start)")
+                    first_token = False
                 full_text.append(token_str)
                 yield token_str
                 
         meta["model_used"] = config.PRIMARY_MODEL
-        logger.info(f"Stream completed using primary model: {config.PRIMARY_MODEL}")
+        logger.info(f"Stream completed using primary model: {config.PRIMARY_MODEL} in {time.time() - llm_start:.4f}s. Total pipeline time: {time.time() - start_time:.4f}s")
     except Exception as e:
         logger.warning(f"Primary model stream failed: {str(e)}. Attempting stream with fallback model: {config.FALLBACK_MODEL}")
         full_text = []
         try:
             stream = fallback_model.stream(messages)
             meta["model_used"] = config.FALLBACK_MODEL
+            first_token = True
             for chunk in stream:
                 token = chunk.content
                 
@@ -731,10 +824,14 @@ def query_rag_chain_stream(
                     token_str = str(token) if token is not None else ""
                     
                 if token_str:
+                    if first_token:
+                        first_token_time = time.time() - start_time
+                        logger.info(f"Timing - First token received (fallback) at {first_token_time:.4f}s elapsed (from start)")
+                        first_token = False
                     full_text.append(token_str)
                     yield token_str
                     
-            logger.info(f"Stream completed using fallback model: {config.FALLBACK_MODEL}")
+            logger.info(f"Stream completed using fallback model: {config.FALLBACK_MODEL} in {time.time() - llm_start:.4f}s. Total pipeline time: {time.time() - start_time:.4f}s")
         except Exception as e_fallback:
             logger.error(f"Both streaming models failed: {str(e_fallback)}", exc_info=True)
             raise e_fallback

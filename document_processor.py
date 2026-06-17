@@ -22,7 +22,7 @@ def calculate_file_hash(file_bytes: bytes) -> str:
     file_hash = hashlib.md5(file_bytes).hexdigest()
     return f"pdf_{file_hash}"
 
-def process_pdf(file_bytes: bytes, file_name: str) -> List[Document]:
+def process_pdf(file_bytes: bytes, file_name: str, progress_callback=None) -> List[Document]:
     """Loads PDF from bytes, extracts text per page, validates the content,
     splits it into chunks, and returns the list of chunks with 1-indexed page metadata.
     """
@@ -30,6 +30,8 @@ def process_pdf(file_bytes: bytes, file_name: str) -> List[Document]:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     
     logger.info(f"Starting processing of file: {file_name}")
+    if progress_callback:
+        progress_callback("📂 Loading PDF and extracting text pages...")
     
     # Save uploaded bytes to a temporary file for PyPDFLoader
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
@@ -42,6 +44,9 @@ def process_pdf(file_bytes: bytes, file_name: str) -> List[Document]:
         docs = loader.load()
         logger.info(f"Loaded PDF with {len(docs)} pages.")
         
+        if progress_callback:
+            progress_callback(f"📄 Successfully loaded {len(docs)} pages. Running text validation...")
+            
         # Validate that the PDF is not scanned/empty (text extraction validation)
         total_text = "".join([doc.page_content for doc in docs])
         logger.info(f"Total extracted text length: {len(total_text)} characters.")
@@ -52,6 +57,9 @@ def process_pdf(file_bytes: bytes, file_name: str) -> List[Document]:
                 "The chatbot cannot read scanned/image-only PDFs without OCR."
             )
             
+        if progress_callback:
+            progress_callback("⚙️ Creating hierarchical search chunks (parent/child)...")
+
         # 1. Create Parent Splitter and Child Splitter
         parent_splitter = RecursiveCharacterTextSplitter(
             chunk_size=config.PARENT_CHUNK_SIZE,
@@ -89,6 +97,8 @@ def process_pdf(file_bytes: bytes, file_name: str) -> List[Document]:
                 ))
                 
         logger.info(f"Successfully created {len(child_docs)} child chunks from {len(parent_docs)} parent chunks.")
+        if progress_callback:
+            progress_callback(f"✓ Split document into {len(child_docs)} search chunks. Almost there!")
         return child_docs
         
     except Exception as e:
@@ -196,6 +206,16 @@ class RateLimitedEmbeddings(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         return self.base_embeddings.embed_query(text)
 
+import streamlit as st
+
+@st.cache_resource(show_spinner=False)
+def _load_huggingface_embeddings(model_name: str):
+    from langchain_huggingface import HuggingFaceEmbeddings
+    logger.info(f"Loading local embedding model ({model_name}) into cache...")
+    return HuggingFaceEmbeddings(
+        model_name=model_name
+    )
+
 def get_embedding_model(progress_callback=None) -> Embeddings:
     """Returns the correct embedding model based on EMBEDDING_PROVIDER configuration."""
     provider = config.EMBEDDING_PROVIDER
@@ -213,15 +233,12 @@ def get_embedding_model(progress_callback=None) -> Embeddings:
         return RateLimitedEmbeddings(base_embeddings, progress_callback=progress_callback)
     else:
         # Default to local
-        from langchain_huggingface import HuggingFaceEmbeddings
         logger.info(
             f"Using LOCAL embeddings (sentence-transformers) — no rate limits, no API cost. Model: {config.LOCAL_EMBEDDING_MODEL}"
         )
         if progress_callback:
             progress_callback(f"Loading local embedding model ({config.LOCAL_EMBEDDING_MODEL})...")
-        embeddings = HuggingFaceEmbeddings(
-            model_name=config.LOCAL_EMBEDDING_MODEL
-        )
+        embeddings = _load_huggingface_embeddings(config.LOCAL_EMBEDDING_MODEL)
         return embeddings
 
 def get_vector_store(collection_name: str, chunks: List[Document] = None, progress_callback=None) -> "Chroma":
@@ -234,6 +251,8 @@ def get_vector_store(collection_name: str, chunks: List[Document] = None, progre
         from langchain_community.vectorstores import Chroma
         
     logger.info(f"Accessing vector store for collection: {collection_name}")
+    if progress_callback:
+        progress_callback("🔑 Checking document credentials and initializing database model...")
     
     embeddings = get_embedding_model(progress_callback=progress_callback)
     
@@ -285,14 +304,24 @@ def get_vector_store(collection_name: str, chunks: List[Document] = None, progre
             existing_count = 0
         else:
             logger.info(f"Collection {collection_name} already populated with {existing_count} chunks. Skipping embedding.")
+            if progress_callback:
+                progress_callback("✓ Existing vector store matching this document found in cache. Loading vectors...")
             check_and_build_bm25_from_db(collection_name, db)
+            if progress_callback:
+                progress_callback("✓ Hybrid search indexes verified. We are almost there...")
             return db
         
     if chunks:
         logger.info(f"Embedding {len(chunks)} chunks into collection {collection_name}...")
+        if progress_callback:
+            progress_callback(f"🧠 Generating neural embeddings for {len(chunks)} text chunks...")
         db.add_documents(chunks)
         logger.info("Embedding and storage complete.")
+        if progress_callback:
+            progress_callback("✓ Neural indexing completed. Building keyword lookup index...")
         build_and_persist_bm25(collection_name, chunks)
+        if progress_callback:
+            progress_callback("✓ Hybrid database indexing completed successfully. We are almost there...")
     else:
         logger.warning(f"Collection {collection_name} is empty and no chunks were provided to populate it.")
         

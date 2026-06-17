@@ -268,11 +268,14 @@ with st.sidebar:
                     
                 logger.info(f"File uploaded successfully: {uploaded_file.name} ({size_str}), Hash: {file_hash}")
                 
-                with st.spinner("Processing..."):
+                with st.status("📄 Loading PDF document...", expanded=True) as status_container:
                     try:
+                        def progress_callback(text):
+                            st.write(text)
+
                         # Check if Chroma already has this collection stored
                         db_exists = False
-                        existing_db = get_vector_store(file_hash, chunks=None)
+                        existing_db = get_vector_store(file_hash, chunks=None, progress_callback=progress_callback)
                         
                         try:
                             existing_count = existing_db._collection.count()
@@ -296,8 +299,8 @@ with st.sidebar:
                             
                         # If not exist, process PDF and populate store
                         if not db_exists:
-                            chunks = process_pdf(file_bytes, uploaded_file.name)
-                            db = get_vector_store(file_hash, chunks)
+                            chunks = process_pdf(file_bytes, uploaded_file.name, progress_callback=progress_callback)
+                            db = get_vector_store(file_hash, chunks, progress_callback=progress_callback)
                             pages_processed = len(set(c.metadata.get("page_number", 0) for c in chunks))
                             logger.info(f"Processed new document: {uploaded_file.name} into {pages_processed} pages.")
                             
@@ -308,6 +311,7 @@ with st.sidebar:
                         st.session_state["pages_processed"] = pages_processed
                         st.session_state["db"] = db
                         
+                        status_container.update(label="✓ Document loaded successfully!", state="complete", expanded=False)
                         st.rerun()
                         
                     except ValueError as val_err:
@@ -419,34 +423,36 @@ else:
                 # Shared metadata container (passed by reference to generator)
                 meta = {"source_pages": [], "model_used": ""}
                 
-                # Show immediate status placeholder
-                status_placeholder = st.empty()
-                status_placeholder.markdown("🔍 *DocuMind is retrieving facts and referencing pages...*")
-                
-                # Stream the response using st.write_stream
-                from rag_chain import query_rag_chain_stream
-                stream_generator = query_rag_chain_stream(user_query, chat_history, db, meta)
-                
-                def stream_wrapper():
-                    import time
-                    cleared = False
-                    for chunk in stream_generator:
-                        if not cleared:
-                            status_placeholder.empty()
-                            cleared = True
+                # Show immediate status using st.status for instant feedback
+                with st.status("🔍 Searching document...", expanded=True) as status_container:
+                    # Define status callback for progressive updates
+                    def status_callback(text):
+                        st.write(text)
                         
-                        # Split chunk by space to simulate a smooth word-by-word typing speed
-                        words = chunk.split(" ")
-                        for idx, word in enumerate(words):
-                            if idx == len(words) - 1:
-                                yield word
-                            else:
-                                yield word + " "
-                            time.sleep(0.04)
-                    if not cleared:
-                        status_placeholder.empty()
+                    # Stream the response using st.write_stream
+                    from rag_chain import query_rag_chain_stream
+                    stream_generator = query_rag_chain_stream(
+                        user_query, chat_history, db, meta, status_callback=status_callback
+                    )
+                    
+                    def stream_wrapper():
+                        first = True
+                        for chunk in stream_generator:
+                            if first:
+                                # Collapse status block and mark complete when first token arrives
+                                status_container.update(
+                                    label="✓ Document searched", state="complete", expanded=False
+                                )
+                                first = False
+                            yield chunk
                         
-                answer = st.write_stream(stream_wrapper())
+                        # Fallback in case no tokens were yielded
+                        if first:
+                            status_container.update(
+                                label="✓ Search finished", state="complete", expanded=False
+                            )
+                            
+                    answer = st.write_stream(stream_wrapper())
 
                 # Post-process response to see if it failed to find answer
                 not_found_indicators = [
