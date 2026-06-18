@@ -33,6 +33,22 @@ except ImportError:
         except ImportError:
             EnsembleRetriever = None
 
+def is_greeting(query: str) -> bool:
+    clean = query.lower().strip().translate(str.maketrans("", "", ".,?!:;()[]{}"))
+    greetings = {
+        "hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon", "good evening",
+        "how are you", "how is it going", "hows it going", "whats up", "what is up",
+        "thank you", "thanks", "thank you very much", "thanks a lot", "thank you!",
+        "bye", "goodbye", "see you", "clear history", "reset history",
+        "who are you", "what are you", "tell me about yourself", "what can you do", "help"
+    }
+    if clean in greetings:
+        return True
+    words = clean.split()
+    if len(words) <= 3 and any(w in greetings for w in words):
+        return True
+    return False
+
 class LoggingHybridRetriever(BaseRetriever):
     ensemble_retriever: Any
     semantic_retriever: Any
@@ -171,16 +187,23 @@ def format_chat_history(chat_history: List[Dict[str, Any]]) -> str:
 
 def needs_rephrasing(question: str) -> bool:
     """Detects whether a follow-up question references chat history.
-    If it is self-contained, we can skip the rephrasing LLM call.
+    If it is self-contained, we can skip the rephrasing.
     """
+    if is_greeting(question):
+        return False
+        
     words = question.lower().translate(str.maketrans("", "", ".,?!:;")).split()
+    if not words:
+        return False
+        
     # Very short queries (e.g. "why?", "explain further") almost certainly depend on context
     if len(words) < 4:
         return True
         
+    # Standard reference pronouns and adjectives
     reference_words = {
         "this", "that", "it", "them", "these", "those", "they", "their", "he", "him", "his", "she", "her",
-        "who", "why", "how", "previous", "above", "before", "again", "also", "too", "other", "another",
+        "previous", "above", "before", "again", "also", "too", "other", "another",
         "yes", "no", "correct", "ok", "okay", "alternative", "detail", "details", "more", "explain",
         "describe", "summarize", "elaborate", "same"
     }
@@ -189,12 +212,19 @@ def needs_rephrasing(question: str) -> bool:
         if word in reference_words:
             return True
             
-    # Check for context-dependent phrasing
-    q_lower = question.lower()
-    phrases = ["what about", "tell me", "what does", "what did", "what was", "in contrast", "compare to"]
-    for phrase in phrases:
+    # Check for context-dependent phrasing (removed standard question starters like 'what was')
+    q_lower = question.lower().strip()
+    context_phrases = [
+        "what about", "how about", "tell me more", "in contrast", "compare to",
+        "and for", "any other", "what of", "what else", "go deeper"
+    ]
+    for phrase in context_phrases:
         if phrase in q_lower:
             return True
+            
+    # Check if it starts with joining words implying continuation
+    if q_lower.startswith("and ") or q_lower.startswith("or "):
+        return True
             
     return False
 
@@ -313,159 +343,106 @@ def retrieve_and_combine_docs(
     fallback_model: ChatGoogleGenerativeAI,
     status_callback=None
 ) -> Tuple[List[Document], bool]:
-    """Decomposes the query if compound, runs retrieval for each sub-query,
-    and returns a combined, deduplicated list of documents. Also returns a boolean
-    indicating if the query was compound.
+    """Retrieves relevant chunks directly for the question.
+    Decomposition is disabled to optimize speed and API usage.
     """
+    if is_greeting(standalone_question):
+        logger.info("Greeting/conversational query detected. Bypassing document retrieval.")
+        return [], False
+        
     if status_callback:
-        status_callback("Analyzing question complexity...")
-        
-    # Fast local pre-check to bypass decomposition for simple questions
-    if not is_likely_compound(standalone_question):
-        logger.info(f"Local heuristic detected simple question. Bypassing decomposition LLM call for: '{standalone_question}'")
-        if status_callback:
-            status_callback("Searching document...")
-        # Simple question: retrieve N=4 chunks
-        retriever = get_hybrid_retriever(db, 4)
-        docs = retriever.invoke(standalone_question)
-        logger.info(f"Retrieved {len(docs)} chunks for simple question.")
-        return docs, False
-        
-    logger.info(f"Local heuristic detected likely compound question. Proceeding to LLM decomposition for: '{standalone_question}'")
-    if status_callback:
-        status_callback("Breaking down compound question...")
-        
-    # Decompose the question into sub-queries
-    sub_queries = decompose_query(standalone_question, primary_model, fallback_model)
-    
-    is_compound = len(sub_queries) > 1
-    
-    if is_compound:
-        logger.info(f"Compound question detected. Decomposed sub-queries: {sub_queries}")
-        if status_callback:
-            status_callback(f"Searching document for: {', '.join(sub_queries)}...")
-            
-        # When compound, retrieve N=5 chunks per sub-query to ensure adequate coverage
-        k = 5
-        all_docs = []
-        
-        import concurrent.futures
-        def retrieve_sub_query(sub_q):
-            logger.info(f"Retrieving top {k} chunks for sub-query: '{sub_q}'")
-            retriever = get_hybrid_retriever(db, k)
-            sub_docs = retriever.invoke(sub_q)
-            logger.info(f"Retrieved {len(sub_docs)} chunks for sub-query: '{sub_q}'. Pages: {[d.metadata.get('page_number') for d in sub_docs]}")
-            return sub_docs
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(sub_queries)) as executor:
-            future_to_query = {executor.submit(retrieve_sub_query, sub_q): sub_q for sub_q in sub_queries}
-            for future in concurrent.futures.as_completed(future_to_query):
-                sub_q = future_to_query[future]
-                try:
-                    sub_docs = future.result()
-                    all_docs.extend(sub_docs)
-                except Exception as exc:
-                    logger.error(f"Sub-query '{sub_q}' generated an exception during retrieval: {exc}", exc_info=True)
-            
-        # Deduplicate retrieved child documents by page_content to avoid redundant text
-        seen_contents = set()
-        unique_docs = []
-        for doc in all_docs:
-            if doc.page_content not in seen_contents:
-                seen_contents.add(doc.page_content)
-                unique_docs.append(doc)
-                
-        logger.info(f"Combined and deduplicated retrieved chunks: {len(unique_docs)} unique chunks (out of {len(all_docs)} total retrieved)")
-        return unique_docs, True
-    else:
-        # Simple question: retrieve N=4 chunks as before
-        logger.info(f"LLM decomposition decided question is simple after all. Retrieving top 4 chunks.")
-        if status_callback:
-            status_callback("Searching document...")
-        retriever = get_hybrid_retriever(db, 4)
-        docs = retriever.invoke(standalone_question)
-        logger.info(f"Retrieved {len(docs)} chunks for simple question.")
-        return docs, False
+        status_callback("Searching document...")
+    # Retrieve top 6 chunks for direct, fast search
+    retriever = get_hybrid_retriever(db, 6)
+    docs = retriever.invoke(standalone_question)
+    logger.info(f"Retrieved {len(docs)} chunks.")
+    return docs, False
 
 
 def filter_used_pages(
     answer: str,
     docs: List[Document],
     primary_model: ChatGoogleGenerativeAI,
-    fallback_model: ChatGoogleGenerativeAI
+    fallback_model: ChatGoogleGenerativeAI,
+    question: str = None
 ) -> List[int]:
-    """Uses the LLM to inspect the final answer and identify which of the retrieved
-    document pages actually support the answer.
+    """Identifies the unique page numbers from the retrieved documents that were
+    actually relevant/used to formulate the answer based on content overlap.
+    Matches strictly against chunk content (not parent content) to avoid false citations.
     """
     if "couldn't find this" in answer.lower():
         logger.info("Answer states info not found. Returning empty sources.")
         return []
         
-    # Get all unique page numbers
-    unique_pages = sorted(list(set(
-        doc.metadata.get("page_number")
-        for doc in docs
-        if doc.metadata.get("page_number") is not None
-    )))
+    # Clean and tokenize the answer
+    clean_answer = re.sub(r'[^\w\s-]', '', answer.lower())
+    answer_words = set(w for w in clean_answer.split() if len(w) > 2)
     
-    # Group chunk snippets by page number to ensure all facts retrieved on a page are visible to the LLM
-    page_contents = {}
-    for doc in docs:
-        page_num = doc.metadata.get("page_number")
-        if page_num is not None:
-            if page_num not in page_contents:
-                page_contents[page_num] = []
-            page_contents[page_num].append(doc.page_content.strip().replace("\n", " "))
+    # Stop words
+    stop_words = {
+        "the", "and", "for", "that", "this", "with", "from", "was", "were", "are", "been", "have", "has",
+        "not", "but", "their", "will", "would", "about", "more", "than", "other", "some", "any", "such",
+        "into", "only", "also", "its", "our", "your", "they", "them", "these", "those"
+    }
+    
+    important_words = answer_words - stop_words
+    
+    # If question is provided, filter out words that were already in the question
+    if question:
+        clean_question = re.sub(r'[^\w\s-]', '', question.lower())
+        question_words = set(w for w in clean_question.split() if len(w) > 2)
+        important_words = important_words - question_words
             
-    candidates = []
-    for page_num in sorted(page_contents.keys()):
-        # Join snippets of the same page, limiting total text to 1000 characters per page
-        full_page_snippet = " | ".join(page_contents[page_num])
-        if len(full_page_snippet) > 1000:
-            full_page_snippet = full_page_snippet[:1000] + "..."
-        candidates.append(f"Page {page_num}: {full_page_snippet}")
-            
-    if not candidates:
+    if not important_words:
         return []
         
-    candidates_str = "\n".join(candidates)
+    used_pages = set()
+    scores = []
     
-    prompt = (
-        "Identify which of the following candidate pages directly support the facts stated in the answer.\n"
-        "Filter out any pages that do not contain information supporting any part of the answer.\n\n"
-        f"Answer:\n{answer}\n\n"
-        f"Candidate Pages:\n{candidates_str}\n\n"
-        "Return only a comma-separated list of the page numbers (e.g., '9, 63') that actually supported the answer. "
-        "Do not include any other text."
-    )
-    
-    try:
-        logger.info("Attempting to filter used pages using primary model.")
-        response = primary_model.invoke(prompt)
-        raw_output = _extract_text(response.content)
-    except Exception as e:
-        logger.warning(f"Failed to filter pages using primary model: {str(e)}. Trying fallback model.")
-        try:
-            response = fallback_model.invoke(prompt)
-            raw_output = _extract_text(response.content)
-        except Exception as e_fallback:
-            logger.error(f"Both models failed to filter pages: {str(e_fallback)}. Returning all candidate pages.")
-            return unique_pages
+    for doc in docs:
+        page_num = doc.metadata.get("page_number")
+        if page_num is None:
+            continue
             
-    # Parse numbers from raw_output
-    used_pages = []
-    numbers = re.findall(r'\d+', raw_output)
-    for num_str in numbers:
-        try:
-            val = int(num_str)
-            if val in unique_pages:
-                used_pages.append(val)
-        except ValueError:
-            pass
+        content = doc.page_content.lower()
+        search_text = re.sub(r'[^\w\s-]', '', content)
+        search_text = re.sub(r'\s+', ' ', search_text)
+        
+        # Calculate overlap score
+        match_count = 0
+        for word in important_words:
+            if any(c.isdigit() for c in word):
+                digit_only = "".join(c for c in word if c.isdigit())
+                if digit_only:
+                    val = int(digit_only)
+                    weight = 1 if ((1900 <= val <= 2100) or (val < 100)) else 5
+                else:
+                    weight = 1
+            else:
+                weight = 1
+                
+            if f" {word} " in f" {search_text} ":
+                match_count += weight
+                
+        scores.append((page_num, match_count))
+        
+    if not scores:
+        return []
+        
+    max_score = max(score[1] for score in scores)
+    if max_score == 0:
+        return []
+        
+    # We require a minimum overlap of 3 score units, and at least 60% of the maximum score
+    threshold = max(3, max_score * 0.6)
+    for page_num, score in scores:
+        if score >= threshold:
+            used_pages.add(page_num)
             
-    filtered = sorted(list(set(used_pages)))
-    logger.info(f"Filtered source pages: {filtered} (from candidates: {unique_pages})")
-    return filtered
+    result = sorted(list(used_pages))
+    logger.info(f"Filtered used pages: {scores} -> {result} (max score: {max_score}, threshold: {threshold:.2f})")
+    return result
+
 
 
 def rephrase_question(
@@ -474,38 +451,80 @@ def rephrase_question(
     primary_model: ChatGoogleGenerativeAI,
     fallback_model: ChatGoogleGenerativeAI
 ) -> str:
-    """Rephrases a follow-up question into a standalone question using chat history."""
-    if not chat_history or not needs_rephrasing(question):
-        if chat_history:
-            logger.info(f"Skipping rephrasing: question '{question}' appears self-contained.")
+    """Combines the current question with key context words from history
+    only if the question is detected as context-dependent.
+    """
+    if is_greeting(question):
         return question
 
-    formatted_history = format_chat_history(chat_history)
-    rephrase_instruction = (
-        "Given the following conversation history and a follow-up question, rephrase the follow-up question "
-        "to be a standalone question (in English). Do NOT answer the question, just rephrase it.\n"
-        "If the follow-up question is already standalone or doesn't refer to the history, "
-        "return it exactly as it is."
-    )
-    
-    prompt = f"{rephrase_instruction}\n\nChat History:\n{formatted_history}\n\nFollow-up Question: {question}\n\nStandalone Question:"
-    
+    if not chat_history:
+        return question
+
+    # First check if the question actually needs context from history
+    if not needs_rephrasing(question):
+        logger.info("Question is self-contained. Skipping heuristic query expansion.")
+        return question
+
+    # Get the last user message from history to expand context keywords
+    last_user_msg = None
+    for msg in reversed(chat_history):
+        if msg["role"] == "user":
+            last_user_msg = msg["content"]
+            break
+
+    if last_user_msg:
+        # Simple heuristic context expansion (e.g., search queries are just bag of words)
+        logger.info("Applying fast heuristic query expansion for context-dependent question.")
+        return f"{last_user_msg} {question}"
+    return question
+
+_primary_model = None
+_fallback_model = None
+
+def get_chat_models() -> Tuple[ChatGoogleGenerativeAI, ChatGoogleGenerativeAI]:
+    """Retrieves cached instances of ChatGoogleGenerativeAI models to avoid instantiation delay.
+    Configures max_retries to 0 for instant fallback on rate limits.
+    """
+    global _primary_model, _fallback_model
     try:
-        logger.info(f"Attempting to rephrase question using primary model: {config.PRIMARY_MODEL}")
-        response = primary_model.invoke(prompt)
-        standalone = _extract_text(response.content)
-        logger.info(f"Successfully rephrased question: '{standalone}'")
-        return standalone
+        import streamlit as st
+        # Use Streamlit's cache_resource to keep the models cached across sessions/reruns
+        @st.cache_resource(show_spinner=False)
+        def _get_cached_models(primary_model_name, fallback_model_name, api_key):
+            logger.info("Initializing and caching ChatGoogleGenerativeAI models using Streamlit cache...")
+            p_model = ChatGoogleGenerativeAI(
+                model=primary_model_name,
+                temperature=0,
+                google_api_key=api_key,
+                max_retries=0
+            )
+            f_model = ChatGoogleGenerativeAI(
+                model=fallback_model_name,
+                temperature=0,
+                google_api_key=api_key,
+                max_retries=0
+            )
+            return p_model, f_model
+        
+        return _get_cached_models(config.PRIMARY_MODEL, config.FALLBACK_MODEL, config.GEMINI_API_KEY)
     except Exception as e:
-        logger.warning(f"Primary model rephrasing failed: {str(e)}. Trying fallback model: {config.FALLBACK_MODEL}")
-        try:
-            response = fallback_model.invoke(prompt)
-            standalone = _extract_text(response.content)
-            logger.info(f"Successfully rephrased question with fallback model: '{standalone}'")
-            return standalone
-        except Exception as e_fallback:
-            logger.error(f"Both models failed to rephrase question: {str(e_fallback)}. Using original question.")
-            return question
+        # Fallback to standard Python global cache if Streamlit is not available or errors out
+        if _primary_model is None or _fallback_model is None:
+            logger.info("Initializing ChatGoogleGenerativeAI models (caching globally)...")
+            _primary_model = ChatGoogleGenerativeAI(
+                model=config.PRIMARY_MODEL,
+                temperature=0,
+                google_api_key=config.GEMINI_API_KEY,
+                max_retries=0
+            )
+            _fallback_model = ChatGoogleGenerativeAI(
+                model=config.FALLBACK_MODEL,
+                temperature=0,
+                google_api_key=config.GEMINI_API_KEY,
+                max_retries=0
+            )
+        return _primary_model, _fallback_model
+
 
 
 def query_rag_chain(
@@ -529,17 +548,8 @@ def query_rag_chain(
     if status_callback:
         status_callback("Checking history...")
 
-    # Initialize chat models
-    primary_model = ChatGoogleGenerativeAI(
-        model=config.PRIMARY_MODEL,
-        temperature=0,
-        google_api_key=config.GEMINI_API_KEY
-    )
-    fallback_model = ChatGoogleGenerativeAI(
-        model=config.FALLBACK_MODEL,
-        temperature=0,
-        google_api_key=config.GEMINI_API_KEY
-    )
+    # Initialize chat models (caching globally to prevent startup lag)
+    primary_model, fallback_model = get_chat_models()
 
     # 1. Rephrase user question if chat history exists
     standalone_question = rephrase_question(question, chat_history, primary_model, fallback_model)
@@ -566,46 +576,47 @@ def query_rag_chain(
         "Always scan deeply for parenthetical details, footnotes, and regional terminology aliases "
         "(such as equivalent names, synonyms, or naming conventions) within the context text to ensure "
         "no hidden context is missed. Answer factually based on these details.\n"
-        "If you cannot find the answer in the provided context, reply exactly with: "
+        "Note: The user may refer to a section header or note number (e.g., 'Note 2' or 'Note 17') that exists on earlier pages of the document or spans multiple pages. The retrieved chunks are labeled with their page numbers. If the text in the context chunks contains the requested information on the specified topic (e.g., noncontrolling interests, profit-sharing, or segment tables), assume it is correct and answer the question even if the specific note number header itself is not explicitly visible in the retrieved text block.\n"
+        "For general greetings (e.g., 'hi', 'hello', 'good morning', 'how are you') or polite conversational messages (e.g., 'thank you', 'bye'), respond friendly, politely, and naturally. Do not require document context or citations for these conversational messages, and write [Sources: None] at the end.\n"
+        "If the user asks for a summary of the entire PDF, do not say you couldn't find it. Instead, explain that you can help query specific details of this document, identify the document name/type from the context (e.g., Tesla Form 10-K), and provide a brief high-level overview of the major sections covered in the context chunks, ending with [Sources: None] or pages if appropriate.\n"
+        "If you cannot find the answer in the provided context and the query is not a greeting or a general summary request, reply exactly with: "
         "\"I couldn't find this in the document\" - do not make up information.\n"
         "If the user's question contains multiple distinct sub-questions/asks, you must address "
         "each part clearly in your answer (e.g., using separate sentences or a bulleted list).\n"
         "Do NOT include any inline page citations or bracketed page references (such as '[Page 27]' or 'Page 27') "
-        "in your final text response. Just provide the textual answer directly (e.g., you are allowed and encouraged "
-        "to include names, dates, financial statistics, or employee counts normally in your text).\n"
-        "If a specific sub-part of the question cannot be found in the context, state clearly for that part "
-        "that it was not found, while still answering the other parts that are present in the context. "
-        "Do not refuse the entire query if only one part is missing.\n"
+        "in your main text response. Just provide the textual answer directly.\n"
+        "At the very end of your response, you MUST list the source page numbers you used to answer the question, formatted exactly like: "
+        "[Sources: Page X, Page Y] "
+        "If no sources were used, write [Sources: None]. Do not include any other text after this bracket.\n"
         "Do not use any external knowledge or assumptions. Keep your answer factual, direct, and concise."
     )
 
-    # Reconstruct context from parent chunks for hierarchical RAG, fallback to child if not present
-    seen_parents = set()
+    # Reconstruct context from retrieved chunks
     seen_contents = set()
-    unique_parent_docs = []
+    unique_docs = []
     
     for doc in docs:
-        parent_id = doc.metadata.get("parent_id")
-        parent_content = doc.metadata.get("parent_content")
-        
-        content = parent_content if parent_content else doc.page_content
+        content = doc.page_content
         page_num = doc.metadata.get("page_number", "Unknown")
-        
-        if parent_id:
-            if parent_id not in seen_parents:
-                seen_parents.add(parent_id)
-                unique_parent_docs.append((page_num, content))
-        else:
-            if content not in seen_contents:
-                seen_contents.add(content)
-                unique_parent_docs.append((page_num, content))
+        if content not in seen_contents:
+            seen_contents.add(content)
+            unique_docs.append((page_num, content))
             
     context_str = "\n\n".join([
         f"[Page {page_num}]:\n{content}"
-        for page_num, content in unique_parent_docs
+        for page_num, content in unique_docs
     ])
 
-    user_content = f"Context:\n{context_str}\n\nQuestion: {standalone_question}"
+    # Format chat history for prompt context
+    history_str = ""
+    if chat_history:
+        history_str = "Conversation History:\n"
+        for msg in chat_history[-5:]: # Keep last 5 messages for context
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_str += f"{role}: {msg['content']}\n"
+        history_str += "\n"
+
+    user_content = f"Context:\n{context_str}\n\n{history_str}Current Question: {question}"
 
     messages = [
         SystemMessage(content=system_instruction),
@@ -648,11 +659,25 @@ def query_rag_chain(
         "i couldn't find this"
     ]
     has_found = not any(indicator in answer.lower() for indicator in not_found_indicators)
-    used_pages = filter_used_pages(answer, docs, primary_model, fallback_model) if has_found else []
+    
+    # Parse source pages from the end of the answer
+    source_pages = []
+    if has_found:
+        import re
+        sources_match = re.search(r'\[Sources:\s*(.*?)\]', answer)
+        if sources_match:
+            sources_str = sources_match.group(1)
+            answer = answer.replace(sources_match.group(0), "").strip()
+            if "none" not in sources_str.lower():
+                page_nums = re.findall(r'\d+', sources_str)
+                source_pages = sorted(list(set(int(p) for p in page_nums)))
+                
+        if not source_pages:
+            source_pages = filter_used_pages(answer, docs, primary_model, fallback_model, question=standalone_question)
 
     return {
         "answer": answer,
-        "source_pages": used_pages,
+        "source_pages": source_pages,
         "model_used": model_used,
         "retrieved_docs": docs
     }
@@ -680,17 +705,8 @@ def query_rag_chain_stream(
     if status_callback:
         status_callback("Checking history...")
 
-    # Initialize chat models
-    primary_model = ChatGoogleGenerativeAI(
-        model=config.PRIMARY_MODEL,
-        temperature=0,
-        google_api_key=config.GEMINI_API_KEY
-    )
-    fallback_model = ChatGoogleGenerativeAI(
-        model=config.FALLBACK_MODEL,
-        temperature=0,
-        google_api_key=config.GEMINI_API_KEY
-    )
+    # Initialize chat models (caching globally to prevent startup lag)
+    primary_model, fallback_model = get_chat_models()
 
     # 1. Rephrase user question if needed
     standalone_question = rephrase_question(question, chat_history, primary_model, fallback_model)
@@ -717,46 +733,47 @@ def query_rag_chain_stream(
         "Always scan deeply for parenthetical details, footnotes, and regional terminology aliases "
         "(such as equivalent names, synonyms, or naming conventions) within the context text to ensure "
         "no hidden context is missed. Answer factually based on these details.\n"
-        "If you cannot find the answer in the provided context, reply exactly with: "
+        "Note: The user may refer to a section header or note number (e.g., 'Note 2' or 'Note 17') that exists on earlier pages of the document or spans multiple pages. The retrieved chunks are labeled with their page numbers. If the text in the context chunks contains the requested information on the specified topic (e.g., noncontrolling interests, profit-sharing, or segment tables), assume it is correct and answer the question even if the specific note number header itself is not explicitly visible in the retrieved text block.\n"
+        "For general greetings (e.g., 'hi', 'hello', 'good morning', 'how are you') or polite conversational messages (e.g., 'thank you', 'bye'), respond friendly, politely, and naturally. Do not require document context or citations for these conversational messages, and write [Sources: None] at the end.\n"
+        "If the user asks for a summary of the entire PDF, do not say you couldn't find it. Instead, explain that you can help query specific details of this document, identify the document name/type from the context (e.g., Tesla Form 10-K), and provide a brief high-level overview of the major sections covered in the context chunks, ending with [Sources: None] or pages if appropriate.\n"
+        "If you cannot find the answer in the provided context and the query is not a greeting or a general summary request, reply exactly with: "
         "\"I couldn't find this in the document\" - do not make up information.\n"
         "If the user's question contains multiple distinct sub-questions/asks, you must address "
         "each part clearly in your answer (e.g., using separate sentences or a bulleted list).\n"
         "Do NOT include any inline page citations or bracketed page references (such as '[Page 27]' or 'Page 27') "
-        "in your final text response. Just provide the textual answer directly (e.g., you are allowed and encouraged "
-        "to include names, dates, financial statistics, or employee counts normally in your text).\n"
-        "If a specific sub-part of the question cannot be found in the context, state clearly for that part "
-        "that it was not found, while still answering the other parts that are present in the context. "
-        "Do not refuse the entire query if only one part is missing.\n"
+        "in your main text response. Just provide the textual answer directly.\n"
+        "At the very end of your response, you MUST list the source page numbers you used to answer the question, formatted exactly like: "
+        "[Sources: Page X, Page Y] "
+        "If no sources were used, write [Sources: None]. Do not include any other text after this bracket.\n"
         "Do not use any external knowledge or assumptions. Keep your answer factual, direct, and concise."
     )
 
-    # Reconstruct context from parent chunks for hierarchical RAG, fallback to child if not present
-    seen_parents = set()
+    # Reconstruct context from retrieved chunks
     seen_contents = set()
-    unique_parent_docs = []
+    unique_docs = []
     
     for doc in docs:
-        parent_id = doc.metadata.get("parent_id")
-        parent_content = doc.metadata.get("parent_content")
-        
-        content = parent_content if parent_content else doc.page_content
+        content = doc.page_content
         page_num = doc.metadata.get("page_number", "Unknown")
-        
-        if parent_id:
-            if parent_id not in seen_parents:
-                seen_parents.add(parent_id)
-                unique_parent_docs.append((page_num, content))
-        else:
-            if content not in seen_contents:
-                seen_contents.add(content)
-                unique_parent_docs.append((page_num, content))
+        if content not in seen_contents:
+            seen_contents.add(content)
+            unique_docs.append((page_num, content))
             
     context_str = "\n\n".join([
         f"[Page {page_num}]:\n{content}"
-        for page_num, content in unique_parent_docs
+        for page_num, content in unique_docs
     ])
 
-    user_content = f"Context:\n{context_str}\n\nQuestion: {standalone_question}"
+    # Format chat history for prompt context
+    history_str = ""
+    if chat_history:
+        history_str = "Conversation History:\n"
+        for msg in chat_history[-5:]: # Keep last 5 messages for context
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_str += f"{role}: {msg['content']}\n"
+        history_str += "\n"
+
+    user_content = f"Context:\n{context_str}\n\n{history_str}Current Question: {question}"
 
     messages = [
         SystemMessage(content=system_instruction),

@@ -22,6 +22,37 @@ def calculate_file_hash(file_bytes: bytes) -> str:
     file_hash = hashlib.md5(file_bytes).hexdigest()
     return f"pdf_{file_hash}"
 
+def count_pdf_pages(file_bytes: bytes) -> int:
+    """Counts the pages of a PDF from bytes quickly using pypdf.PdfReader."""
+    import io
+    from pypdf import PdfReader
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        return len(reader.pages)
+    except Exception as e:
+        logger.error(f"Failed to count PDF pages: {e}")
+        return 1
+
+def get_stored_provider(collection_name: str) -> str:
+    """Retrieves the stored embedding provider from Chroma collection metadata
+    without loading the embedding model itself.
+    """
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=config.VECTOR_STORE_PATH)
+        collection = client.get_collection(name=collection_name)
+        if collection.metadata:
+            # If chunking mode is not page_level or chunk_size doesn't match, force re-indexing
+            if collection.metadata.get("chunking_mode") != "page_level":
+                return None
+            stored_chunk_size = collection.metadata.get("chunk_size")
+            if stored_chunk_size != config.CHILD_CHUNK_SIZE:
+                return None
+            return collection.metadata.get("provider")
+    except Exception:
+        pass
+    return None
+
 def process_pdf(file_bytes: bytes, file_name: str, progress_callback=None) -> List[Document]:
     """Loads PDF from bytes, extracts text per page, validates the content,
     splits it into chunks, and returns the list of chunks with 1-indexed page metadata.
@@ -31,7 +62,7 @@ def process_pdf(file_bytes: bytes, file_name: str, progress_callback=None) -> Li
     
     logger.info(f"Starting processing of file: {file_name}")
     if progress_callback:
-        progress_callback("📂 Loading PDF and extracting text pages...")
+        progress_callback("📂 Processing document...")
     
     # Save uploaded bytes to a temporary file for PyPDFLoader
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
@@ -45,7 +76,7 @@ def process_pdf(file_bytes: bytes, file_name: str, progress_callback=None) -> Li
         logger.info(f"Loaded PDF with {len(docs)} pages.")
         
         if progress_callback:
-            progress_callback(f"📄 Successfully loaded {len(docs)} pages. Running text validation...")
+            progress_callback("📄 Processing document...")
             
         # Validate that the PDF is not scanned/empty (text extraction validation)
         total_text = "".join([doc.page_content for doc in docs])
@@ -58,48 +89,44 @@ def process_pdf(file_bytes: bytes, file_name: str, progress_callback=None) -> Li
             )
             
         if progress_callback:
-            progress_callback("⚙️ Creating hierarchical search chunks (parent/child)...")
+            progress_callback("⚙️ Processing document...")
 
-        # 1. Create Parent Splitter and Child Splitter
-        parent_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=config.PARENT_CHUNK_SIZE,
-            chunk_overlap=config.PARENT_CHUNK_OVERLAP,
-            length_function=len
-        )
-        child_splitter = RecursiveCharacterTextSplitter(
+        # Create the text splitter for page content splitting
+        splitter = RecursiveCharacterTextSplitter(
             chunk_size=config.CHILD_CHUNK_SIZE,
             chunk_overlap=config.CHILD_CHUNK_OVERLAP,
             length_function=len
         )
         
-        # 2. Split PDF into parent chunks first
-        parent_docs = parent_splitter.split_documents(docs)
-        logger.info(f"Split PDF into {len(parent_docs)} parent chunks.")
-        
-        # 3. Create child chunks that keep reference and context of their parents
-        child_docs = []
-        for i, parent_doc in enumerate(parent_docs):
-            page_idx = parent_doc.metadata.get("page", 0)
+        chunks = []
+        # Process page-by-page
+        for doc in docs:
+            page_idx = doc.metadata.get("page", 0)
             page_num = page_idx + 1
             
-            # Split the parent text into child texts
-            sub_docs = child_splitter.split_text(parent_doc.page_content)
+            # Split this page's text into sub-chunks
+            page_text = doc.page_content
+            sub_texts = splitter.split_text(page_text)
             
-            for sub_doc in sub_docs:
-                child_metadata = parent_doc.metadata.copy()
-                child_metadata["page_number"] = page_num
-                child_metadata["parent_id"] = f"parent_{i}"
-                child_metadata["parent_content"] = parent_doc.page_content
+            for sub_text in sub_texts:
+                # Prepend context breadcrumb directly to the chunk text
+                context_breadcrumb = f"[Source: {file_name}, Page {page_num}] "
+                injected_text = f"{context_breadcrumb}{sub_text}"
                 
-                child_docs.append(Document(
-                    page_content=sub_doc,
-                    metadata=child_metadata
+                chunk_metadata = doc.metadata.copy()
+                chunk_metadata["page_number"] = page_num
+                chunk_metadata["parent_id"] = None
+                chunk_metadata["parent_content"] = None
+                
+                chunks.append(Document(
+                    page_content=injected_text,
+                    metadata=chunk_metadata
                 ))
                 
-        logger.info(f"Successfully created {len(child_docs)} child chunks from {len(parent_docs)} parent chunks.")
+        logger.info(f"Split PDF page-by-page into {len(chunks)} contextual flat chunks.")
         if progress_callback:
-            progress_callback(f"✓ Split document into {len(child_docs)} search chunks. Almost there!")
-        return child_docs
+            progress_callback("✓ Almost there...")
+        return chunks
         
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}", exc_info=True)
@@ -133,17 +160,15 @@ class RateLimitedEmbeddings(Embeddings):
             
             # Apply sliding window rate limiter if enabled
             if config.ENABLE_RATE_LIMITER:
-                batch_chars = sum(len(text) for text in batch)
                 while True:
                     now = time.time()
                     # Keep history of only the last 60 seconds
                     self.request_history = [r for r in self.request_history if now - r[0] < 60.0]
                     
                     recent_requests = len(self.request_history)
-                    recent_chars = sum(r[1] for r in self.request_history)
                     
-                    # Gemini Free Tier limit: max 15 RPM and ~30k tokens (~100k-120k characters) per minute
-                    if recent_requests >= 14 or (recent_chars + batch_chars) > 100000:
+                    # Gemini Free Tier limit: max 15 RPM (requests per minute).
+                    if recent_requests >= 14:
                         if self.request_history:
                             oldest_time = self.request_history[0][0]
                             wait_time = 60.0 - (now - oldest_time) + 0.5
@@ -162,7 +187,7 @@ class RateLimitedEmbeddings(Embeddings):
             msg = f"Generating embeddings: batch {batch_num}/{total_batches} ({len(batch)} chunks)..."
             logger.info(f"RateLimitedEmbeddings: {msg}")
             if self.progress_callback:
-                self.progress_callback(msg)
+                self.progress_callback(f"🧠 Processing document (batch {batch_num}/{total_batches})...")
             
             retries = 5
             backoff = 10.0
@@ -216,15 +241,18 @@ def _load_huggingface_embeddings(model_name: str):
         model_name=model_name
     )
 
-def get_embedding_model(progress_callback=None) -> Embeddings:
-    """Returns the correct embedding model based on EMBEDDING_PROVIDER configuration."""
-    provider = config.EMBEDDING_PROVIDER
+def get_embedding_model(provider: str = None, progress_callback=None) -> Embeddings:
+    """Returns the correct embedding model based on the specified provider (defaults to config.EMBEDDING_PROVIDER)."""
+    if provider is None:
+        provider = config.EMBEDDING_PROVIDER
+        
+    provider = provider.lower()
     if provider == "google":
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
         if not config.GEMINI_API_KEY:
             raise ValueError("GEMINI_API_KEY is not set in the environment variables.")
         logger.info(
-            f"Using GOOGLE embeddings (API) — rate limited, billed per use. Model: {config.GOOGLE_EMBEDDING_MODEL}"
+            f"Using GOOGLE embeddings (API) — Model: {config.GOOGLE_EMBEDDING_MODEL}"
         )
         base_embeddings = GoogleGenerativeAIEmbeddings(
             model=config.GOOGLE_EMBEDDING_MODEL,
@@ -234,16 +262,16 @@ def get_embedding_model(progress_callback=None) -> Embeddings:
     else:
         # Default to local
         logger.info(
-            f"Using LOCAL embeddings (sentence-transformers) — no rate limits, no API cost. Model: {config.LOCAL_EMBEDDING_MODEL}"
+            f"Using LOCAL embeddings (sentence-transformers) — Model: {config.LOCAL_EMBEDDING_MODEL}"
         )
         if progress_callback:
-            progress_callback(f"Loading local embedding model ({config.LOCAL_EMBEDDING_MODEL})...")
+            progress_callback("🧠 Initializing search engine (loading local embedding model, this may take a moment)...")
         embeddings = _load_huggingface_embeddings(config.LOCAL_EMBEDDING_MODEL)
         return embeddings
 
-def get_vector_store(collection_name: str, chunks: List[Document] = None, progress_callback=None) -> "Chroma":
-    """Retrieves or creates a Chroma vector store for the given collection name.
-    If chunks are provided and the store is empty, it will add the chunks to the store.
+def get_vector_store(collection_name: str, chunks: List[Document] = None, provider: str = None, progress_callback=None) -> "Chroma":
+    """Retrieves or creates a Chroma vector store for the given collection name using the specified provider.
+    If provider is not specified, tries to read the stored provider from metadata first.
     """
     try:
         from langchain_chroma import Chroma
@@ -252,16 +280,25 @@ def get_vector_store(collection_name: str, chunks: List[Document] = None, progre
         
     logger.info(f"Accessing vector store for collection: {collection_name}")
     if progress_callback:
-        progress_callback("🔑 Checking document credentials and initializing database model...")
+        progress_callback("🔑 Preparing search indexes...")
     
-    embeddings = get_embedding_model(progress_callback=progress_callback)
+    # Check if a provider was already stored for this collection in metadata
+    if provider is None:
+        provider = get_stored_provider(collection_name)
+        
+    # If still not found, fallback to config
+    if provider is None:
+        provider = config.EMBEDDING_PROVIDER
+        
+    provider = provider.lower()
+    embeddings = get_embedding_model(provider=provider, progress_callback=progress_callback)
     
     # Initialize Chroma db
     db = Chroma(
         collection_name=collection_name,
         embedding_function=embeddings,
         persist_directory=config.VECTOR_STORE_PATH,
-        collection_metadata={"provider": config.EMBEDDING_PROVIDER}
+        collection_metadata={"provider": provider, "chunking_mode": "page_level", "chunk_size": config.CHILD_CHUNK_SIZE}
     )
     
     # Check if documents already exist in the collection
@@ -272,24 +309,24 @@ def get_vector_store(collection_name: str, chunks: List[Document] = None, progre
         existing_count = 0
         
     if existing_count > 0:
-        # Check if stored provider in collection metadata matches the current provider
+        # Check stored metadata parameters to verify compatibility
         stored_metadata = db._collection.metadata
         stored_provider = None
+        stored_chunking_mode = None
+        stored_chunk_size = None
         if stored_metadata:
             stored_provider = stored_metadata.get("provider")
+            stored_chunking_mode = stored_metadata.get("chunking_mode")
+            stored_chunk_size = stored_metadata.get("chunk_size")
             
-        current_provider = config.EMBEDDING_PROVIDER
-        
-        if stored_provider and stored_provider != current_provider:
+        if (stored_provider and stored_provider != provider) or (stored_chunking_mode != "page_level") or (stored_chunk_size != config.CHILD_CHUNK_SIZE):
             logger.warning(
-                f"⚠️ WARNING: Embedding provider switch detected for collection '{collection_name}'. "
-                f"Stored: '{stored_provider}', Current: '{current_provider}'. "
-                "Local and Google embeddings are not numerically compatible. Re-indexing collection..."
+                f"⚠️ WARNING: Incompatible database detected for collection '{collection_name}'. "
+                f"Stored Provider: '{stored_provider}', Chunking: '{stored_chunking_mode}', Chunk Size: '{stored_chunk_size}'. "
+                "Re-indexing collection..."
             )
             if progress_callback:
-                progress_callback(
-                    f"⚠️ Provider switch detected ({stored_provider} -> {current_provider}). Re-indexing..."
-                )
+                progress_callback("⚠️ Upgrading indexing format. Re-indexing...")
             
             # Delete incompatible collection
             db.delete_collection()
@@ -299,29 +336,29 @@ def get_vector_store(collection_name: str, chunks: List[Document] = None, progre
                 collection_name=collection_name,
                 embedding_function=embeddings,
                 persist_directory=config.VECTOR_STORE_PATH,
-                collection_metadata={"provider": current_provider}
+                collection_metadata={"provider": provider, "chunking_mode": "page_level", "chunk_size": config.CHILD_CHUNK_SIZE}
             )
             existing_count = 0
         else:
             logger.info(f"Collection {collection_name} already populated with {existing_count} chunks. Skipping embedding.")
             if progress_callback:
-                progress_callback("✓ Existing vector store matching this document found in cache. Loading vectors...")
+                progress_callback("✓ Loading cached index...")
             check_and_build_bm25_from_db(collection_name, db)
             if progress_callback:
-                progress_callback("✓ Hybrid search indexes verified. We are almost there...")
+                progress_callback("✓ Almost there...")
             return db
         
     if chunks:
         logger.info(f"Embedding {len(chunks)} chunks into collection {collection_name}...")
         if progress_callback:
-            progress_callback(f"🧠 Generating neural embeddings for {len(chunks)} text chunks...")
+            progress_callback("🧠 Indexing document content...")
         db.add_documents(chunks)
         logger.info("Embedding and storage complete.")
         if progress_callback:
-            progress_callback("✓ Neural indexing completed. Building keyword lookup index...")
+            progress_callback("✓ Neural indexing completed.")
         build_and_persist_bm25(collection_name, chunks)
         if progress_callback:
-            progress_callback("✓ Hybrid database indexing completed successfully. We are almost there...")
+            progress_callback("✓ Almost there...")
     else:
         logger.warning(f"Collection {collection_name} is empty and no chunks were provided to populate it.")
         

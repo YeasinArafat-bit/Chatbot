@@ -10,7 +10,7 @@ A modern, retrieval-augmented generation (RAG) web application that allows users
 2. **Robust RAG Pipeline:** Extracts document content, splits it into chunks preserving page metadata, generates high-quality embeddings, and stores them in a local Chroma vector database.
 3. **Smart Re-upload Handling:** Computes file hashes to instantly load previously processed documents without parsing or re-embedding them.
 4. **Conversational Memory:** Uses chat history to rephrase follow-up questions to query the vector store contextually.
-5. **Model Fallback for High Reliability:** Attempts query answering via a primary model (`gemini-flash-lite-latest`), falling back automatically to a secondary model (`gemini-3.1-flash-lite`) if necessary, logging all execution details.
+5. **Model Fallback for High Reliability:** Attempts query answering via a primary model (`gemini-2.5-flash`), falling back automatically to a secondary model (`gemini-1.5-flash-latest`) if necessary, logging all execution details.
 6. **Graceful Scanned Document Validation:** Detects whether a PDF is an image-only/scanned document (lacks selectable text) and alerts the user with helpful tips.
 7. **Page-Level Citations:** Displays precise source page citations (e.g., *Page 3*, *Page 8*) below assistant replies.
 

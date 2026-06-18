@@ -256,7 +256,13 @@ with st.sidebar:
                 )
                 logger.warning(f"File upload rejected due to size: {uploaded_file.name} ({file_size_mb:.2f}MB)")
             else:
-                from document_processor import calculate_file_hash, get_vector_store, process_pdf
+                from document_processor import (
+                    calculate_file_hash, 
+                    get_vector_store, 
+                    process_pdf,
+                    count_pdf_pages,
+                    get_stored_provider
+                )
                 file_bytes = uploaded_file.read()
                 file_hash = calculate_file_hash(file_bytes)
                 
@@ -267,62 +273,113 @@ with st.sidebar:
                     size_str = f"{file_size_mb:.2f} MB"
                     
                 logger.info(f"File uploaded successfully: {uploaded_file.name} ({size_str}), Hash: {file_hash}")
+                # Render the custom CSS loading line immediately!
+                loading_placeholder = st.sidebar.empty()
+                loading_html = """
+                <div class="loading-line-container">
+                    <div class="loading-line"></div>
+                </div>
+                <style>
+                .loading-line-container {
+                    width: 100%;
+                    height: 4px;
+                    background-color: #334155;
+                    border-radius: 2px;
+                    overflow: hidden;
+                    margin-top: 15px;
+                    margin-bottom: 15px;
+                }
+                .loading-line {
+                    height: 100%;
+                    background: linear-gradient(90deg, #6366f1 0%, #a855f7 100%);
+                    box-shadow: 0 0 8px #a855f7;
+                    width: 0%;
+                    animation: crawl 45s cubic-bezier(0.1, 0.8, 0.1, 1.0) forwards, pulse 1.5s infinite alternate;
+                }
+                @keyframes crawl {
+                    0% { width: 0%; }
+                    10% { width: 35%; }
+                    30% { width: 65%; }
+                    60% { width: 88%; }
+                    100% { width: 98%; }
+                }
+                @keyframes pulse {
+                    0% { opacity: 0.7; }
+                    100% { opacity: 1; }
+                }
+                </style>
+                <div style="font-size: 0.85rem; color: #94a3b8; text-align: center; margin-top: -10px;">
+                    ⚡ Loading document...
+                </div>
+                """
+                loading_placeholder.markdown(loading_html, unsafe_allow_html=True)
+                import time
+                time.sleep(0.1) # Yield control to Streamlit event loop to render the loader in the browser
                 
-                with st.status("📄 Loading PDF document...", expanded=True) as status_container:
+                try:
+                    # Determine provider config to avoid rate limits
+                    stored_provider = get_stored_provider(file_hash)
+                    if stored_provider is not None:
+                        provider = stored_provider
+                    else:
+                        provider = config.EMBEDDING_PROVIDER
+                        logger.info(f"Using configured EMBEDDING_PROVIDER: {provider}")
+                    
+                    # 1. Fast check if database already exists (silent check)
+                    db_exists = False
+                    existing_db = get_vector_store(file_hash, chunks=None, provider=provider, progress_callback=None)
+                    
                     try:
-                        def progress_callback(text):
-                            st.write(text)
-
-                        # Check if Chroma already has this collection stored
+                        existing_count = existing_db._collection.count()
+                    except Exception:
+                        existing_count = 0
+                        
+                    if existing_count > 0:
+                        db_exists = True
+                        db = existing_db
+                        
+                        # Extract pages processed from existing database metadata
+                        existing_docs = existing_db.get()
+                        pages = set()
+                        for meta in existing_docs.get("metadatas", []):
+                            if meta and "page_number" in meta:
+                                pages.add(meta["page_number"])
+                        pages_processed = len(pages) if pages else 1
+                        logger.info(f"Loaded existing database collection {file_hash} ({provider}) with {pages_processed} pages.")
+                    else:
                         db_exists = False
-                        existing_db = get_vector_store(file_hash, chunks=None, progress_callback=progress_callback)
                         
-                        try:
-                            existing_count = existing_db._collection.count()
-                        except Exception:
-                            existing_count = 0
-                            
-                        if existing_count > 0:
-                            db_exists = True
-                            db = existing_db
-                            
-                            # Extract pages processed from existing database metadata
-                            existing_docs = existing_db.get()
-                            pages = set()
-                            for meta in existing_docs.get("metadatas", []):
-                                if meta and "page_number" in meta:
-                                    pages.add(meta["page_number"])
-                            pages_processed = len(pages) if pages else 1
-                            logger.info(f"Loaded existing database collection {file_hash} with {pages_processed} pages.")
-                        else:
-                            db_exists = False
-                            
-                        # If not exist, process PDF and populate store
-                        if not db_exists:
-                            chunks = process_pdf(file_bytes, uploaded_file.name, progress_callback=progress_callback)
-                            db = get_vector_store(file_hash, chunks, progress_callback=progress_callback)
-                            pages_processed = len(set(c.metadata.get("page_number", 0) for c in chunks))
-                            logger.info(f"Processed new document: {uploaded_file.name} into {pages_processed} pages.")
-                            
-                        # Save status to session state
-                        st.session_state["collection_name"] = file_hash
-                        st.session_state["active_file_name"] = uploaded_file.name
-                        st.session_state["active_file_size"] = size_str
-                        st.session_state["pages_processed"] = pages_processed
-                        st.session_state["db"] = db
+                    # 2. If not exist, process PDF and rebuild store
+                    if not db_exists:
+                        chunks = process_pdf(file_bytes, uploaded_file.name, progress_callback=None)
+                        db = get_vector_store(file_hash, chunks, provider=provider, progress_callback=None)
+                        pages_processed = len(set(c.metadata.get("page_number", 0) for c in chunks))
+                        logger.info(f"Processed new document: {uploaded_file.name} into {pages_processed} pages using {provider} provider.")
+                    else:
+                        db = existing_db
                         
-                        status_container.update(label="✓ Document loaded successfully!", state="complete", expanded=False)
-                        st.rerun()
+                    # Save status to session state
+                    st.session_state["collection_name"] = file_hash
+                    st.session_state["active_file_name"] = uploaded_file.name
+                    st.session_state["active_file_size"] = size_str
+                    st.session_state["pages_processed"] = pages_processed
+                    st.session_state["db"] = db
+                    
+                    # Clear loading animation
+                    loading_placeholder.empty()
+                    st.rerun()
                         
-                    except ValueError as val_err:
-                        st.error(f"⚠️ Document validation failed: {str(val_err)}")
-                        logger.warning(f"Validation failure on {uploaded_file.name}: {str(val_err)}")
-                    except Exception as e:
-                        st.error(
-                            "❌ This PDF could not be read. It may be corrupt, password-protected, "
-                            "or contains scanned images without OCR text selectable elements."
-                        )
-                        logger.error(f"Error handling PDF parsing/embedding: {str(e)}", exc_info=True)
+                except ValueError as val_err:
+                    loading_placeholder.empty()
+                    st.error(f"⚠️ Document validation failed: {str(val_err)}")
+                    logger.warning(f"Validation failure on {uploaded_file.name}: {str(val_err)}")
+                except Exception as e:
+                    loading_placeholder.empty()
+                    st.error(
+                        f"❌ This PDF could not be read (Error: {str(e)}).\n\n"
+                        "It may be corrupt, password-protected, or contain scanned images without OCR text selectable elements."
+                    )
+                    logger.error(f"Error handling PDF parsing/embedding: {str(e)}", exc_info=True)
                         
     # 2. Document details and clear button (if loaded)
     else:
@@ -397,11 +454,15 @@ else:
                 source_pages = msg.get("source_pages", [])
                 model_used = msg.get("model_used", "")
                 
-                # Check if we have any source pages to display
-                if source_pages:
+                # Check if we have page citations or model info to display
+                if source_pages or model_used:
                     citation_html = '<div class="citation-container">'
-                    page_chips = " ".join([f'<span class="citation-chip">Page {p}</span>' for p in source_pages])
-                    citation_html += f'<span>Sources: {page_chips}</span>'
+                    if source_pages:
+                        page_chips = " ".join([f'<span class="citation-chip">Page {p}</span>' for p in source_pages])
+                        citation_html += f'<span>Sources: {page_chips}</span>'
+                    if model_used:
+                        display_model = model_used.split("/")[-1]
+                        citation_html += f'<span class="model-badge">🤖 {display_model}</span>'
                     citation_html += '</div>'
                     st.markdown(citation_html, unsafe_allow_html=True)
 
@@ -423,36 +484,39 @@ else:
                 # Shared metadata container (passed by reference to generator)
                 meta = {"source_pages": [], "model_used": ""}
                 
-                # Show immediate status using st.status for instant feedback
-                with st.status("🔍 Searching document...", expanded=True) as status_container:
-                    # Define status callback for progressive updates
-                    def status_callback(text):
-                        st.write(text)
-                        
-                    # Stream the response using st.write_stream
+                # Show a simple, clean spinner while searching and preparing stream
+                with st.spinner("Processing..."):
                     from rag_chain import query_rag_chain_stream
                     stream_generator = query_rag_chain_stream(
-                        user_query, chat_history, db, meta, status_callback=status_callback
+                        user_query, chat_history, db, meta, status_callback=None
                     )
                     
+                    # Consume first chunk to trigger retrieval steps under the spinner
+                    try:
+                        first_chunk = next(stream_generator)
+                        has_chunks = True
+                    except StopIteration:
+                        first_chunk = ""
+                        has_chunks = False
+                
+                # Stream response outside of the spinner to print ChatGPT letter-by-letter style
+                if has_chunks:
                     def stream_wrapper():
-                        first = True
+                        import time
+                        # Yield the first chunk letter-by-letter smoothly
+                        for char in first_chunk:
+                            yield char
+                            time.sleep(0.02) # standard delay for smooth letter-by-letter typing (20ms)
+                        # Yield the remaining chunks letter-by-letter smoothly
                         for chunk in stream_generator:
-                            if first:
-                                # Collapse status block and mark complete when first token arrives
-                                status_container.update(
-                                    label="✓ Document searched", state="complete", expanded=False
-                                )
-                                first = False
-                            yield chunk
-                        
-                        # Fallback in case no tokens were yielded
-                        if first:
-                            status_container.update(
-                                label="✓ Search finished", state="complete", expanded=False
-                            )
-                            
+                            for char in chunk:
+                                yield char
+                                time.sleep(0.02)
+                                
                     answer = st.write_stream(stream_wrapper())
+                else:
+                    answer = "I couldn't retrieve an answer."
+                    st.write(answer)
 
                 # Post-process response to see if it failed to find answer
                 not_found_indicators = [
@@ -461,26 +525,43 @@ else:
                     "i couldn't find this"
                 ]
                 
+                source_pages = []
                 if any(indicator in answer.lower() for indicator in not_found_indicators):
-                    source_pages = []
+                    pass
                 else:
-                    # Run page filtering with a loading spinner for a clean ChatGPT-like experience
-                    with st.spinner("🔍 Referencing source pages..."):
+                    # Parse sources from LLM response
+                    import re
+                    sources_match = re.search(r'\[Sources:\s*(.*?)\]', answer)
+                    if sources_match:
+                        sources_str = sources_match.group(1)
+                        # Remove the raw tag from the saved answer text
+                        answer = answer.replace(sources_match.group(0), "").strip()
+                        if "none" not in sources_str.lower():
+                            page_nums = re.findall(r'\d+', sources_str)
+                            source_pages = sorted(list(set(int(p) for p in page_nums)))
+                    
+                    if not source_pages:
+                        # Instantly retrieve unique pages from docs as fallback
                         from rag_chain import filter_used_pages
                         source_pages = filter_used_pages(
                             answer,
                             meta.get("retrieved_docs", []),
                             meta.get("primary_model"),
-                            meta.get("fallback_model")
+                            meta.get("fallback_model"),
+                            question=user_query
                         )
                 
                 model_used = meta["model_used"]
                 
-                # Display citations below completed stream
-                if source_pages:
+                # Display citations and model badge below completed stream
+                if source_pages or model_used:
                     citation_html = '<div class="citation-container">'
-                    page_chips = " ".join([f'<span class="citation-chip">Page {p}</span>' for p in source_pages])
-                    citation_html += f'<span>Sources: {page_chips}</span>'
+                    if source_pages:
+                        page_chips = " ".join([f'<span class="citation-chip">Page {p}</span>' for p in source_pages])
+                        citation_html += f'<span>Sources: {page_chips}</span>'
+                    if model_used:
+                        display_model = model_used.split("/")[-1]
+                        citation_html += f'<span class="model-badge">🤖 {display_model}</span>'
                     citation_html += '</div>'
                     st.markdown(citation_html, unsafe_allow_html=True)
                 
@@ -496,11 +577,18 @@ else:
                 st.rerun()
                 
             except Exception as e:
-                friendly_error = (
-                    "Sorry, I encountered an error while retrieving your answer. "
-                    "This could be due to a temporary network issue or an invalid API Key. "
-                    "Please verify your connection and key, then try again."
-                )
+                err_msg = str(e).lower()
+                friendly_error = "Sorry, I encountered an error while retrieving your answer."
+                
+                if any(x in err_msg for x in ["connection", "timeout", "dns", "newconnectionerror", "maxretryerror", "host", "socket"]):
+                    friendly_error = "❌ Network Connection Issue: Could not connect to the API. Please check your internet connection and try again."
+                elif any(x in err_msg for x in ["api_key_invalid", "invalid_api_key", "unauthorized", "api key is not valid", "401"]):
+                    friendly_error = "🔑 Invalid API Key: Please verify that your GEMINI_API_KEY is correct in your local .env file."
+                elif any(x in err_msg for x in ["resource_exhausted", "429", "quota", "rate limit"]):
+                    friendly_error = "⚠️ Rate Limit Exceeded: You have reached the Gemini API quota limit. Please wait a minute and try again."
+                else:
+                    friendly_error = f"❌ Error: {str(e)}"
+                    
                 st.error(friendly_error)
                 logger.error(f"Error executing Chat RAG Chain query: {str(e)}", exc_info=True)
 

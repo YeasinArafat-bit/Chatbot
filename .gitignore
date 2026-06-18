@@ -24,3 +24,15 @@ env/
 
 # Streamlit config (pushed to git as it does not contain keys)
 #.streamlit/config.toml
+
+# IDE configs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# User PDF uploads (ignored to prevent pushing large document files to git)
+test pdf/
+*.pdf

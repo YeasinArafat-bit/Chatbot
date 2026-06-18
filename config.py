@@ -16,8 +16,12 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-2.5-flash")
 # Embedding Configuration
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local").lower()
 LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-GOOGLE_EMBEDDING_MODEL = os.getenv("GOOGLE_EMBEDDING_MODEL", os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"))
+GOOGLE_EMBEDDING_MODEL = os.getenv("GOOGLE_EMBEDDING_MODEL", os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"))
 EMBEDDING_MODEL = GOOGLE_EMBEDDING_MODEL
+try:
+    SHORT_PDF_THRESHOLD_PAGES = int(os.getenv("SHORT_PDF_THRESHOLD_PAGES", "10"))
+except ValueError:
+    SHORT_PDF_THRESHOLD_PAGES = 10
 
 # File Upload Limit
 try:
@@ -51,9 +55,9 @@ VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "vector_store")
 
 # Embedding API settings for faster ingestion
 try:
-    EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "100"))
+    EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "1000"))
 except ValueError:
-    EMBEDDING_BATCH_SIZE = 100
+    EMBEDDING_BATCH_SIZE = 1000
 
 try:
     EMBEDDING_SLEEP_SECONDS = float(os.getenv("EMBEDDING_SLEEP_SECONDS", "0.2"))
