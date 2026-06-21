@@ -8,9 +8,9 @@ A modern, retrieval-augmented generation (RAG) web application that allows users
 
 Here is the DocuMind interface in action:
 
-![DocuMind UI Chat Interface](screenshots/screenshot1.png)
+![DocuMind UI Chat Interface](screenshots/Screenshot%2010.png)
 
-![DocuMind UI Document Ingestion](screenshots/screenshot2.png)
+![DocuMind UI Document Ingestion](screenshots/Screenshot%2020.png)
 
 ---
 
